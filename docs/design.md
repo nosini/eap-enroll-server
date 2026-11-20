@@ -47,9 +47,14 @@ the phone's keystore and that only this service trusts.
    device credential is signed. If that fails, the device is removed
    again; the code stays used.
 3. With the device credential, the phone gets Wi-Fi certificates
-   (`wifi/simpleenroll`) and renews the credential
-   (`device/simplereenroll`).
-4. `eap-enroll disable ID` marks the device disabled, then revokes its
+   (`wifi/simpleenroll`), the Wi-Fi settings (`wifi/profile`), and renews
+   the credential (`device/simplereenroll`).
+4. Old certificates are revoked once their replacements are known to
+   work: older Wi-Fi certificates when the phone confirms that it has
+   connected with the new one (`wifi/confirm`); older device credentials
+   the first time the phone authenticates with the new one. Until then
+   both stay valid, so a failed renewal never locks the phone out.
+5. `eap-enroll disable ID` marks the device disabled, then revokes its
    unexpired certificates in OpenBao and rotates the CRLs. RADIUS sees
    the revocation after its next CRL fetch.
 
@@ -98,7 +103,7 @@ service doesn't support).
 ## Audit log
 
 JSON lines on standard error (the journal): `code_created`,
-`enroll_device`, `enroll_wifi`, `reenroll_device`,
+`enroll_device`, `enroll_wifi`, `reenroll_device`, `confirm_wifi`,
 `certificate_issued`, `device_disabled`, `cert_revoked`, and
 `<event>_refused` with a `reason` (`bad_code`, `code_used`,
 `code_expired`, `no_code`, `user_disabled`, `device_disabled`,
@@ -124,10 +129,9 @@ hourly.
   library would add many modules).
 - `modernc.org/sqlite`: SQLite without cgo, so the binary stays static.
 
-## Not done yet
+## Lifetimes
 
-- The phone can't yet tell the service which Wi-Fi certificate a new one
-  replaced, so old Wi-Fi certificates stay valid until they expire or
-  the device is disabled.
-- The service doesn't hand out the Wi-Fi profile (SSID, server CA,
-  domain).
+Suggested: Wi-Fi certificates 60 days, device credentials a year. The
+phone renews at about 2/3, so renewal runs every ~40 days and problems
+show up while the old certificate still works. A lost phone that isn't
+disabled keeps Wi-Fi access for at most 60 days.

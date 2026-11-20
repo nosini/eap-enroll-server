@@ -44,6 +44,8 @@ All paths are under `/.well-known/est/`.
 | `POST device/simpleenroll` | `Authorization: Bearer <code>` | CSR for the keystore key | device credential + chain |
 | `POST wifi/simpleenroll` | TLS client certificate: device credential | CSR for a new key | Wi-Fi certificate + chain |
 | `POST device/simplereenroll` | TLS client certificate: device credential | CSR, same or new key | new device credential + chain |
+| `POST wifi/confirm` | TLS client certificate: device credential | serial of the working Wi-Fi certificate | `204`, older Wi-Fi certificates revoked |
+| `GET wifi/profile` | TLS client certificate: device credential | | Wi-Fi network settings (JSON) |
 
 `wifi/simpleenroll` is used for the first Wi-Fi certificate and for every
 renewal. This deviates from EST on purpose: the phone can't use the old
@@ -85,8 +87,51 @@ credential instead.
 A failed CSR check (400) doesn't use up a one-time code; any other
 answer to `device/simpleenroll` does.
 
+### `wifi/confirm`
+
+After the phone has connected to Wi-Fi with a new certificate, it sends
+that certificate's serial number: `text/plain`, hex, with or without
+colons, any case, at most 256 bytes. The service revokes the device's
+Wi-Fi certificates that were issued before that one and answers `204`.
+Repeating the request is harmless. `400` means the serial isn't a
+current Wi-Fi certificate of this device; `502` means revoking failed
+(retry later).
+
+Until the phone confirms, older Wi-Fi certificates stay valid, so a new
+certificate that doesn't work never leaves the phone without Wi-Fi.
+
+### `wifi/profile`
+
+The network the certificates are for, so the app needs no manual
+settings. `404` if the service has no profile configured.
+
+```json
+{
+  "ssid": "Example Net",
+  "server_domain": "radius.example.org",
+  "server_ca_certificates": ["<base64 DER>"]
+}
+```
+
+- `ssid`: exactly as broadcast; it may contain leading or trailing
+  spaces. Never trim it.
+- `server_domain`: the RADIUS server's certificate name, for
+  `WifiEnterpriseConfig.setDomainSuffixMatch()`.
+- `server_ca_certificates`: the CA certificates that issued the RADIUS
+  server's certificate, for `setCaCertificates()`. These aren't the
+  `wifi/cacerts` certificates, which issued the client certificates.
+
+## Device credential renewal
+
+The old device credential keeps working after `device/simplereenroll`
+until the phone first authenticates with the new one; then the service
+revokes the older credentials of that device. So the phone must switch to
+the new credential right after renewing and keep the old one until it
+has.
+
 ## Lifetimes
 
-Set by the service (`wifi_ttl`, `device_ttl`); read them from the
-issued certificates. Renew at about 2/3 of the lifetime. When a
+Set by the service (`wifi_ttl`, `device_ttl`, for example 60 days and
+a year); read them from the issued certificates. Renew at about 2/3 of
+the lifetime. When a
 device credential expires or is revoked, the phone needs a new code.

@@ -98,8 +98,13 @@ cat >state/config.json <<EOF
   "wifi_cacerts_file": "$D/pki/wifi-cacerts.pem",
   "device_cacerts_file": "$D/pki/device-cacerts.pem",
   "database": "$D/state/enroll.db",
-  "wifi_ttl": "2160h",
+  "wifi_ttl": "1440h",
   "device_ttl": "8760h",
+  "wifi_profile": {
+    "ssid": "Test Net ",
+    "server_domain": "radius.example.org",
+    "server_ca_file": "$D/pki/root.pem"
+  },
   "openbao": {
     "address": "https://127.0.0.1:8200",
     "ca_file": "$D/baotls/vault-ca.pem",

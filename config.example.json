@@ -9,8 +9,13 @@
   "device_cacerts_file": "/etc/eap-enroll/device-cacerts.pem",
   "database": "/var/lib/eap-enroll/enroll.db",
   "code_ttl": "15m",
-  "wifi_ttl": "2160h",
+  "wifi_ttl": "1440h",
   "device_ttl": "8760h",
+  "wifi_profile": {
+    "ssid": "Example Net",
+    "server_domain": "radius.example.org",
+    "server_ca_file": "/etc/eap-enroll/radius-server-ca.pem"
+  },
   "openbao": {
     "address": "https://openbao.example.org:8200",
     "ca_file": "/etc/eap-enroll/openbao-ca.pem",

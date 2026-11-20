@@ -39,6 +39,7 @@ fields are errors.
 | `database` | SQLite file. |
 | `code_ttl` | Lifetime of one-time codes (default 15m, at most 24h). |
 | `wifi_ttl`, `device_ttl` | Certificate lifetimes, sent to OpenBao verbatim as `ttl`. |
+| `wifi_profile` | Optional: `ssid` (exact, spaces kept), `server_domain` (RADIUS server certificate name) and `server_ca_file` (CA of the RADIUS server certificate), served at `wifi/profile`. |
 | `openbao.*` | Address, optional CA file and TLS server name, AppRole role ID and secret ID files, and the mounts, roles and KV path (defaults as in the example). |
 
 [deploy/eap-enroll.service](deploy/eap-enroll.service) is an example

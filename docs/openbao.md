@@ -85,7 +85,7 @@ path "pki-radius/sign/eap-client" {
     "csr"                  = []
     "common_name"          = []
     "exclude_cn_from_sans" = [true]
-    "ttl"                  = ["2160h"]
+    "ttl"                  = ["1440h"]
   }
 }
 

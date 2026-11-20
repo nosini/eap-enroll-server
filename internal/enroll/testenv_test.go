@@ -276,6 +276,12 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
+	return newEnvWith(t, nil)
+}
+
+// newEnvWith lets a test change the configuration before it is loaded.
+func newEnvWith(t *testing.T, change func(cfg map[string]any, dir string)) *env {
+	t.Helper()
 	dir := t.TempDir()
 	e := &env{t: t, now: time.Now()}
 	e.root = newRoot(t, "Test Root")
@@ -315,6 +321,9 @@ func newEnv(t *testing.T) *env {
 			"role_id_file":   writeFile(t, dir, "role-id", testRoleID+"\n"),
 			"secret_id_file": writeFile(t, dir, "secret-id", testSecretID+"\n"),
 		},
+	}
+	if change != nil {
+		change(cfgJSON, dir)
 	}
 	raw, _ := json.Marshal(cfgJSON)
 	cfg, err := config.Load(writeFile(t, dir, "config.json", string(raw)))

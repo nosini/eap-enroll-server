@@ -307,6 +307,27 @@ func (s *Store) UnrevokedCertificates(ctx context.Context, deviceID string, now 
 	if err != nil {
 		return nil, err
 	}
+	return scanCertificates(rows)
+}
+
+// OlderCertificates lists a device's unrevoked, unexpired certificates of
+// kind that were recorded before the certificate with serial.
+func (s *Store) OlderCertificates(ctx context.Context, deviceID, kind, serial string, now time.Time) ([]Certificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT serial, kind, device_id, issued, not_after FROM certificates
+		 WHERE device_id = ? AND kind = ? AND revoked IS NULL AND not_after > ?
+		   AND rowid < (SELECT rowid FROM certificates WHERE kind = ? AND serial = ?)
+		 ORDER BY rowid`,
+		deviceID, kind, unix(now), kind, serial)
+	if err != nil {
+		return nil, err
+	}
+	return scanCertificates(rows)
+}
+
+// scanCertificates reads rows of serial, kind, device_id, issued,
+// not_after.
+func scanCertificates(rows *sql.Rows) ([]Certificate, error) {
 	defer rows.Close()
 	var out []Certificate
 	for rows.Next() {

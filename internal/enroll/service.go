@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"net/url"
 	"regexp"
 	"slices"
@@ -308,48 +309,50 @@ func (s *Service) EnrollDevice(ctx context.Context, code string, csr *x509.Certi
 	return dev, certs, nil
 }
 
-// Authenticate maps a verified client certificate to an enabled device.
-// verified must come from tls.ConnectionState.VerifiedChains, so the
-// certificate chains to device_ca_file.
-func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certificate) (store.Device, error) {
+// Authenticate maps a verified client certificate to an enabled device
+// and returns the certificate's serial. verified must come from
+// tls.ConnectionState.VerifiedChains, so the certificate chains to
+// device_ca_file.
+func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certificate) (store.Device, string, error) {
 	if len(verified) == 0 || len(verified[0]) == 0 {
-		return store.Device{}, fail(401, "no_client_cert", "client certificate required", nil)
+		return store.Device{}, "", fail(401, "no_client_cert", "client certificate required", nil)
 	}
 	leaf := verified[0][0]
 	if len(leaf.URIs) != 1 || leaf.URIs[0].Scheme != "urn" || !strings.HasPrefix(leaf.URIs[0].Opaque, "uuid:") {
-		return store.Device{}, fail(401, "unknown_cert", "unknown client certificate", nil)
+		return store.Device{}, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	}
 	id := strings.TrimPrefix(leaf.URIs[0].Opaque, "uuid:")
 	if !uuidPattern.MatchString(id) {
-		return store.Device{}, fail(401, "unknown_cert", "unknown client certificate", nil)
+		return store.Device{}, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	}
 	dev, err := s.store.Device(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
-		return dev, fail(401, "unknown_cert", "unknown client certificate", nil)
+		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	}
 	if err != nil {
-		return dev, fail(500, "store_error", "internal error", err)
+		return dev, "", fail(500, "store_error", "internal error", err)
 	}
 	if dev.Disabled != nil {
-		return dev, fail(403, "device_disabled", "device is disabled", nil)
+		return dev, "", fail(403, "device_disabled", "device is disabled", nil)
 	}
-	cert, err := s.store.Certificate(ctx, store.KindDevice, openbao.SerialText(leaf.SerialNumber))
+	serial := openbao.SerialText(leaf.SerialNumber)
+	cert, err := s.store.Certificate(ctx, store.KindDevice, serial)
 	if errors.Is(err, store.ErrNotFound) || (err == nil && cert.DeviceID != dev.ID) {
-		return dev, fail(401, "unknown_cert", "unknown client certificate", nil)
+		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	}
 	if err != nil {
-		return dev, fail(500, "store_error", "internal error", err)
+		return dev, "", fail(500, "store_error", "internal error", err)
 	}
 	if cert.Revoked != nil {
-		return dev, fail(401, "revoked_cert", "client certificate revoked", nil)
+		return dev, "", fail(401, "revoked_cert", "client certificate revoked", nil)
 	}
 	if !s.now().Before(cert.NotAfter) {
-		return dev, fail(401, "expired_cert", "client certificate expired", nil)
+		return dev, "", fail(401, "expired_cert", "client certificate expired", nil)
 	}
 	if !strings.EqualFold(leaf.Subject.CommonName, dev.Username) {
-		return dev, fail(401, "unknown_cert", "unknown client certificate", nil)
+		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	}
-	return dev, nil
+	return dev, serial, nil
 }
 
 // EnrollWifi issues a Wi-Fi certificate to an authenticated device.
@@ -378,9 +381,14 @@ func (s *Service) DisableDevice(ctx context.Context, id string) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	// Per mount: revoke all, rotate the CRL, then record. A certificate
-	// is only recorded as revoked once the CRL that lists it exists, so a
-	// failed rotation is retried by the next run.
+	return s.revoke(ctx, dev, certs, "device disabled")
+}
+
+// revoke revokes certificates of a device. Per mount: revoke all, rotate
+// the CRL, then record. A certificate is only recorded as revoked once
+// the CRL that lists it exists, so a failed rotation is retried by the
+// next call. It returns the serials that are still to be revoked.
+func (s *Service) revoke(ctx context.Context, dev store.Device, certs []store.Certificate, reason string) ([]string, error) {
 	var remaining []string
 	var errs []error
 	for _, kind := range []string{store.KindWifi, store.KindDevice} {
@@ -413,10 +421,53 @@ func (s *Service) DisableDevice(ctx context.Context, id string) ([]string, error
 				remaining = append(remaining, c.Serial)
 				continue
 			}
-			s.log.Info("cert_revoked", "kind", c.Kind, "device", dev.ID, "username", dev.Username, "serial", c.Serial)
+			s.log.Info("cert_revoked", "kind", c.Kind, "device", dev.ID, "username", dev.Username,
+				"serial", c.Serial, "reason", reason)
 		}
 	}
 	return remaining, errors.Join(errs...)
+}
+
+// revokeOlder revokes the device's certificates of kind that were issued
+// before the one with serial.
+func (s *Service) revokeOlder(ctx context.Context, dev store.Device, kind, serial string) error {
+	older, err := s.store.OlderCertificates(ctx, dev.ID, kind, serial, s.now())
+	if err != nil || len(older) == 0 {
+		return err
+	}
+	_, err = s.revoke(ctx, dev, older, "superseded")
+	return err
+}
+
+// ConfirmWifi is the phone's report that the Wi-Fi certificate with
+// serial works; older Wi-Fi certificates of the device are revoked.
+func (s *Service) ConfirmWifi(ctx context.Context, dev store.Device, serial string) error {
+	serial = normalizeSerial(serial)
+	cert, err := s.store.Certificate(ctx, store.KindWifi, serial)
+	if errors.Is(err, store.ErrNotFound) || (err == nil && cert.DeviceID != dev.ID) {
+		return fail(400, "unknown_serial", "unknown certificate", nil)
+	}
+	if err != nil {
+		return fail(500, "store_error", "internal error", err)
+	}
+	if cert.Revoked != nil {
+		return fail(400, "revoked_serial", "certificate is revoked", nil)
+	}
+	if err := s.revokeOlder(ctx, dev, store.KindWifi, serial); err != nil {
+		return fail(502, "openbao_error", "certificate authority unavailable", err)
+	}
+	return nil
+}
+
+// normalizeSerial accepts hex with or without colons, any case and
+// leading zeros, and returns openbao.SerialText's form ("" if invalid).
+func normalizeSerial(v string) string {
+	v = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(v), ":", ""))
+	n, ok := new(big.Int).SetString(v, 16)
+	if !ok || n.Sign() <= 0 || len(v) > 64 {
+		return ""
+	}
+	return openbao.SerialText(n)
 }
 
 // CleanupCodes deletes expired codes.

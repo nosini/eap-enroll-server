@@ -71,7 +71,7 @@ check "wifi cert CN" "subject=CN=alice" "$(field wifi -subject -nameopt RFC2253)
 field wifi -ext subjectAltName | grep -q . && bad "wifi cert has SANs: $(field wifi -ext subjectAltName)" || ok "wifi cert has no SANs"
 openssl verify -CAfile pki/root.pem -untrusted pki/pki-radius.pem "$W/wifi.leaf.pem" >/dev/null && ok "wifi cert chains to the EAP CA" || bad "wifi chain"
 DAYS=$(( ($(date -d "$(field wifi -enddate | cut -d= -f2)" +%s) - $(date +%s)) / 86400 ))
-case $DAYS in 89|90) ok "wifi lifetime $DAYS days";; *) bad "wifi lifetime $DAYS days";; esac
+case $DAYS in 59|60) ok "wifi lifetime $DAYS days";; *) bad "wifi lifetime $DAYS days";; esac
 check "wifi needs a client cert" 401 "$(est nocert wifi/simpleenroll --data-binary @"$W/wifi.csr")"
 csr wifi256 prime256v1
 check "wifi P-256 refused" 400 "$(est wifi256 wifi/simpleenroll --cert "$W/dev.pem" --key "$W/dev.key" --data-binary @"$W/wifi256.csr")"
@@ -83,6 +83,22 @@ csr dev2 secp384r1
 check "device/simplereenroll P-384" 200 "$(est dev2 device/simplereenroll --cert "$W/dev.pem" --key "$W/dev.key" --data-binary @"$W/dev2.csr")"
 certs dev2
 field dev2 -ext subjectAltName | grep -q "urn:uuid:$DEVID" && ok "renewed credential keeps the device ID" || bad "renewed URI"
+
+# Profile, with the new credential; that retires the old one.
+check "wifi/profile" 200 "$(est profile wifi/profile -X GET --cert "$W/dev2.pem" --key "$W/dev2.key")"
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(p["ssid"] != "Test Net " or p["server_domain"] != "radius.example.org")' "$W/profile.out" \
+  && ok "profile content (SSID with trailing space)" || bad "profile $(cat "$W/profile.out")"
+check "old device credential after the new one was used" 401 "$(est old wifi/simpleenroll --cert "$W/dev.pem" --key "$W/dev.key" --data-binary @"$W/wifi.csr")"
+
+# A second Wi-Fi certificate; confirming it revokes the first.
+check "second wifi/simpleenroll" 200 "$(est wifi2 wifi/simpleenroll --cert "$W/dev2.pem" --key "$W/dev2.key" --data-binary @"$W/wifi.csr")"
+certs wifi2
+check "wifi/confirm" 204 "$(est confirm wifi/confirm --cert "$W/dev2.pem" --key "$W/dev2.key" -H 'Content-Type: text/plain' --data-binary "$(field wifi2 -serial | cut -d= -f2)")"
+curl -s --cacert baotls/vault-ca.pem https://127.0.0.1:8200/v1/pki-radius/crl/pem >"$W/radius1.crl"
+openssl crl -in "$W/radius1.crl" -noout -text | tr -d ' :' | grep -qi "SerialNumber$(field wifi -serial | cut -d= -f2)" \
+  && ok "confirmed: first wifi cert on the CRL" || bad "first wifi cert not on CRL after confirm"
+openssl crl -in "$W/radius1.crl" -noout -text | tr -d ' :' | grep -qi "SerialNumber$(field wifi2 -serial | cut -d= -f2)" \
+  && bad "confirmed cert itself revoked" || ok "confirmed cert not revoked"
 
 # Policy: what the AppRole may and may not do, with its own token.
 TOKEN=$(bao write -field=token auth/approle/login role_id=@state/role-id secret_id=@state/secret-id)
@@ -102,21 +118,21 @@ print(json.dumps(d))' "$@")
     -X POST --data "$body" "$BAO_ADDR/v1/$path")
   case $code in 2*) echo allowed;; 403) echo denied;; *) echo "http-$code";; esac
 }
-check "policy: allowed sign" allowed "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true ttl=2160h)"
+check "policy: allowed sign" allowed "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true ttl=1440h)"
 check "policy: other ttl" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true ttl=17520h)"
 check "policy: no ttl" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true)"
-check "policy: exclude_cn_from_sans=false" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=false ttl=2160h)"
-check "policy: alt_names" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice alt_names=x ttl=2160h exclude_cn_from_sans=true)"
-check "policy: no common_name" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" ttl=2160h exclude_cn_from_sans=true)"
+check "policy: exclude_cn_from_sans=false" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=false ttl=1440h)"
+check "policy: alt_names" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice alt_names=x ttl=1440h exclude_cn_from_sans=true)"
+check "policy: no common_name" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" ttl=1440h exclude_cn_from_sans=true)"
 check "policy: issue (server keygen)" denied "$(pol pki-radius/issue/eap-client common_name=alice)"
 check "policy: sign-verbatim" denied "$(pol pki-radius/sign-verbatim csr=@"$W/p.csr")"
 check "policy: other role" denied "$(pol pki/sign/tls csr=@"$W/p.csr" common_name=enroll.test)"
 check "policy: kv write" denied "$(pol kv/data/apps/freeradius/user-groups 'data=json:{"mallory":"staff"}')"
-check "policy: string \"true\"" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=str:true ttl=2160h)"
+check "policy: string \"true\"" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=str:true ttl=1440h)"
 check "policy: device sign" allowed "$(pol pki-enroll/sign/device csr=@"$W/p.csr" common_name=alice uri_sans=urn:uuid:00000000-0000-4000-8000-000000000000 exclude_cn_from_sans=true ttl=8760h)"
 check "policy: device without uri_sans" denied "$(pol pki-enroll/sign/device csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true ttl=8760h)"
 check "role: device URI outside urn:uuid" http-400 "$(pol pki-enroll/sign/device csr=@"$W/p.csr" common_name=alice uri_sans=https://evil.example exclude_cn_from_sans=true ttl=8760h)"
-check "role: CN outside allowed_domains" http-400 "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=mallory exclude_cn_from_sans=true ttl=2160h)"
+check "role: CN outside allowed_domains" http-400 "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=mallory exclude_cn_from_sans=true ttl=1440h)"
 check "approle: CIDR binding" denied "$(bao write -field=token auth/approle/login role_id=@state/elsewhere-role-id secret_id=@state/elsewhere-secret-id >/dev/null 2>&1 && echo allowed || echo denied)"
 
 # Rate limit: burst of 5 from one address.
@@ -130,7 +146,7 @@ check "rate limit from one address" " 401 401 401 401 401 429" "$codes"
 
 # Disabled user.
 BAO_TOKEN=root bao kv put kv/apps/freeradius/user-groups alice=disabled carol=guests Bob=disabled >/dev/null
-check "wifi for disabled user" 403 "$(est dis wifi/simpleenroll --cert "$W/dev.pem" --key "$W/dev.key" --data-binary @"$W/wifi.csr")"
+check "wifi for disabled user" 403 "$(est dis wifi/simpleenroll --cert "$W/dev2.pem" --key "$W/dev2.key" --data-binary @"$W/wifi.csr")"
 BAO_TOKEN=root bao kv put kv/apps/freeradius/user-groups alice=staff carol=guests Bob=disabled >/dev/null
 check "code for disabled user" 1 "$(bin/eap-enroll code -config "$CFG" -user bob -label x >/dev/null 2>>state/admin.log; echo $?)"
 
@@ -140,7 +156,7 @@ bin/eap-enroll disable -config "$CFG" "$DEVID" 2>>state/admin.log
 check "disable exit" 0 $?
 check "wifi after disable" 403 "$(est after wifi/simpleenroll --cert "$W/dev2.pem" --key "$W/dev2.key" --data-binary @"$W/wifi.csr")"
 curl -s --cacert baotls/vault-ca.pem https://127.0.0.1:8200/v1/pki-radius/crl/pem >"$W/radius.crl"
-SERIAL=$(field wifi -serial | cut -d= -f2)
+SERIAL=$(field wifi2 -serial | cut -d= -f2)
 openssl crl -in "$W/radius.crl" -noout -text | tr -d ' :' | grep -qi "SerialNumber$SERIAL" \
   && ok "wifi cert on the pki-radius CRL" || bad "wifi serial $SERIAL not on CRL"
 curl -s --cacert baotls/vault-ca.pem https://127.0.0.1:8200/v1/pki-enroll/crl/pem >"$W/enroll.crl"

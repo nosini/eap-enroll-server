@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/nosini/eap-enroll-server/internal/config"
+	"github.com/nosini/eap-enroll-server/internal/store"
 )
 
 // maxBody bounds an EST request body (a base64 CSR is well below 2 KiB).
@@ -56,8 +58,21 @@ func (s *Service) Handler() (http.Handler, error) {
 	mux.HandleFunc("GET "+estPrefix+"wifi/cacerts", s.static(wifiCA))
 	mux.HandleFunc("GET "+estPrefix+"device/cacerts", s.static(deviceCA))
 	mux.HandleFunc("POST "+estPrefix+"device/simpleenroll", s.handleDeviceEnroll)
-	mux.HandleFunc("POST "+estPrefix+"wifi/simpleenroll", s.handleMTLS("enroll_wifi", s.wifiProfile()))
-	mux.HandleFunc("POST "+estPrefix+"device/simplereenroll", s.handleMTLS("reenroll_device", s.deviceProfile()))
+	mux.HandleFunc("POST "+estPrefix+"wifi/simpleenroll", s.handleEnroll("enroll_wifi", s.wifiProfile()))
+	mux.HandleFunc("POST "+estPrefix+"device/simplereenroll", s.handleEnroll("reenroll_device", s.deviceProfile()))
+	mux.HandleFunc("POST "+estPrefix+"wifi/confirm", s.authenticated("confirm_wifi", s.handleConfirm))
+	if s.cfg.WifiProfile != nil {
+		profile, err := profileBody(s.cfg.WifiProfile)
+		if err != nil {
+			return nil, err
+		}
+		mux.HandleFunc("GET "+estPrefix+"wifi/profile", s.authenticated("wifi_profile",
+			func(w http.ResponseWriter, r *http.Request, dev store.Device) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Cache-Control", "no-store")
+				w.Write(profile)
+			}))
+	}
 	return mux, nil
 }
 
@@ -179,7 +194,10 @@ func (s *Service) handleDeviceEnroll(w http.ResponseWriter, r *http.Request) {
 	s.respond(w, certs)
 }
 
-func (s *Service) handleMTLS(event string, p profile) http.HandlerFunc {
+// authenticated wraps a handler that needs the device credential: rate
+// limit, client certificate check, and retiring older device credentials
+// once a newer one is in use.
+func (s *Service) authenticated(event string, next func(http.ResponseWriter, *http.Request, store.Device)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if ok, wait := s.limits.allow(clientKey(r.RemoteAddr), s.now()); !ok {
 			s.rateLimited(w, r, event, wait)
@@ -189,11 +207,22 @@ func (s *Service) handleMTLS(event string, p profile) http.HandlerFunc {
 		if r.TLS != nil {
 			chains = r.TLS.VerifiedChains
 		}
-		dev, err := s.Authenticate(r.Context(), chains)
+		dev, serial, err := s.Authenticate(r.Context(), chains)
 		if err != nil {
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
 			return
 		}
+		// The phone uses a renewed credential only once it has it, so
+		// the older ones can go. A failure is retried on the next request.
+		if err := s.revokeOlder(r.Context(), dev, store.KindDevice, serial); err != nil {
+			s.log.Error("revoke_failed", "device", dev.ID, "kind", store.KindDevice, "error", err.Error())
+		}
+		next(w, r, dev)
+	}
+}
+
+func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
+	return s.authenticated(event, func(w http.ResponseWriter, r *http.Request, dev store.Device) {
 		csr, err := readCSR(w, r, p)
 		if err != nil {
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
@@ -206,7 +235,44 @@ func (s *Service) handleMTLS(event string, p profile) http.HandlerFunc {
 		}
 		s.log.Info(event, "remote", r.RemoteAddr, "device", dev.ID, "username", dev.Username, "label", dev.Label)
 		s.respond(w, certs)
+	})
+}
+
+// handleConfirm takes the serial (hex, colons allowed) of a Wi-Fi
+// certificate the phone has connected with and revokes the older ones.
+func (s *Service) handleConfirm(w http.ResponseWriter, r *http.Request, dev store.Device) {
+	const event = "confirm_wifi"
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256))
+	if err != nil {
+		s.refuse(w, r, event, fail(400, "bad_request", "could not read request", nil), "device", dev.ID)
+		return
 	}
+	serial := strings.TrimSpace(string(body))
+	if err := s.ConfirmWifi(r.Context(), dev, serial); err != nil {
+		s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
+		return
+	}
+	s.log.Info(event, "remote", r.RemoteAddr, "device", dev.ID, "username", dev.Username, "serial", normalizeSerial(serial))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// wifiProfile is the body of wifi/profile.
+type wifiProfile struct {
+	SSID                 string   `json:"ssid"`
+	ServerDomain         string   `json:"server_domain"`
+	ServerCACertificates [][]byte `json:"server_ca_certificates"`
+}
+
+func profileBody(p *config.WifiProfile) ([]byte, error) {
+	certs, err := config.ReadCertificates(p.ServerCAFile)
+	if err != nil {
+		return nil, err
+	}
+	body := wifiProfile{SSID: p.SSID, ServerDomain: p.ServerDomain}
+	for _, c := range certs {
+		body.ServerCACertificates = append(body.ServerCACertificates, c.Raw)
+	}
+	return json.Marshal(body)
 }
 
 // keyReloader serves the server certificate and reloads it when the

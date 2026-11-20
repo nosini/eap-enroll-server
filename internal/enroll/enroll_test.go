@@ -15,7 +15,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -117,15 +119,25 @@ func TestFullLifecycle(t *testing.T) {
 		t.Errorf("RSA wifi CSR: %d", r.status)
 	}
 
-	// Device renewal; the old credential stays usable until disabled.
+	// Device renewal: the old credential works until the new one is
+	// used, then it is revoked.
 	newDeviceKey := newKey(t, elliptic.P384())
 	r = e.post(device, "device/simplereenroll", "", csrBody(t, newDeviceKey, "x"))
 	if r.status != 200 || r.certs[0].URIs[0].String() != "urn:uuid:"+deviceID {
 		t.Fatalf("reenroll: %d %s", r.status, r.body)
 	}
 	renewed := e.client(tlsCert(r.certs, newDeviceKey))
+	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 200 {
+		t.Errorf("old credential before the new one is used: %d %s", r.status, r.body)
+	}
 	if r := e.post(renewed, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 200 {
 		t.Errorf("wifi with renewed credential: %d %s", r.status, r.body)
+	}
+	if !contains(e.bao.revoked["pki-enroll"], colonHex(devCert.SerialNumber)) || e.bao.rotates["pki-enroll"] != 1 {
+		t.Errorf("old device credential not revoked: %v %v", e.bao.revoked, e.bao.rotates)
+	}
+	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 401 {
+		t.Errorf("old credential after the new one was used: %d", r.status)
 	}
 
 	// No client certificate.
@@ -133,18 +145,18 @@ func TestFullLifecycle(t *testing.T) {
 		t.Errorf("wifi without client cert: %d", r.status)
 	}
 
-	// Disable: blocks at once, revokes all four certificates, rotates both CRLs.
+	// Disable: blocks at once, revokes the rest, rotates both CRLs.
 	remaining, err := e.svc.DisableDevice(ctx, deviceID)
 	if err != nil || len(remaining) != 0 {
 		t.Fatalf("disable: %v %v", remaining, err)
 	}
-	if n := len(e.bao.revoked["pki-radius"]); n != 2 {
-		t.Errorf("wifi revocations %d, want 2", n)
+	if n := len(e.bao.revoked["pki-radius"]); n != 3 {
+		t.Errorf("wifi revocations %d, want 3", n)
 	}
 	if n := len(e.bao.revoked["pki-enroll"]); n != 2 {
 		t.Errorf("device revocations %d, want 2", n)
 	}
-	if e.bao.rotates["pki-radius"] != 1 || e.bao.rotates["pki-enroll"] != 1 {
+	if e.bao.rotates["pki-radius"] != 1 || e.bao.rotates["pki-enroll"] != 2 {
 		t.Errorf("rotates %v", e.bao.rotates)
 	}
 	if !contains(e.bao.revoked["pki-radius"], colonHex(wifi.SerialNumber)) {
@@ -157,7 +169,7 @@ func TestFullLifecycle(t *testing.T) {
 	if remaining, err := e.svc.DisableDevice(ctx, deviceID); err != nil || len(remaining) != 0 {
 		t.Errorf("second disable: %v %v", remaining, err)
 	}
-	if n := len(e.bao.revoked["pki-radius"]) + len(e.bao.revoked["pki-enroll"]); n != 4 {
+	if n := len(e.bao.revoked["pki-radius"]) + len(e.bao.revoked["pki-enroll"]); n != 5 {
 		t.Errorf("second disable revoked again: %d", n)
 	}
 	list, err := e.store.Devices(ctx)
@@ -436,5 +448,91 @@ func TestClientCAPoolRefusesRoot(t *testing.T) {
 	inter := root.intermediate(t, "Inter")
 	if _, err := clientCAPool(writeFile(t, dir, "ca2.pem", pemCert(inter.cert))); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestConfirmWifi(t *testing.T) {
+	e := newEnv(t)
+	devTLS, _ := e.enrollDevice("alice")
+	c := e.client(devTLS)
+	var wifi []*x509.Certificate
+	for i := 0; i < 3; i++ {
+		r := e.post(c, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+		if r.status != 200 {
+			t.Fatalf("wifi %d: %d", i, r.status)
+		}
+		wifi = append(wifi, r.certs[0])
+	}
+	// Confirming the second revokes only the first.
+	colon := colonHex(wifi[1].SerialNumber)
+	if r := e.post(c, "wifi/confirm", "", []byte(strings.ToUpper(colon)+"\n")); r.status != 204 {
+		t.Fatalf("confirm: %d %s", r.status, r.body)
+	}
+	if got := e.bao.revoked["pki-radius"]; len(got) != 1 || got[0] != colonHex(wifi[0].SerialNumber) {
+		t.Errorf("revoked %v", got)
+	}
+	// Again: nothing new. Then the third revokes the second.
+	if r := e.post(c, "wifi/confirm", "", []byte(colon)); r.status != 204 || len(e.bao.revoked["pki-radius"]) != 1 {
+		t.Errorf("repeated confirm: %d %v", r.status, e.bao.revoked)
+	}
+	if r := e.post(c, "wifi/confirm", "", []byte(openbao.SerialText(wifi[2].SerialNumber))); r.status != 204 {
+		t.Errorf("confirm third: %d", r.status)
+	}
+	if n := len(e.bao.revoked["pki-radius"]); n != 2 {
+		t.Errorf("revocations %d, want 2", n)
+	}
+	// A revoked one, someone else's, or garbage.
+	if r := e.post(c, "wifi/confirm", "", []byte(colon)); r.status != 400 {
+		t.Errorf("confirm revoked: %d", r.status)
+	}
+	otherTLS, _ := e.enrollDevice("carol")
+	if r := e.post(e.client(otherTLS), "wifi/confirm", "", []byte(openbao.SerialText(wifi[2].SerialNumber))); r.status != 400 {
+		t.Errorf("confirm another device's certificate: %d", r.status)
+	}
+	if r := e.post(c, "wifi/confirm", "", []byte("not hex")); r.status != 400 {
+		t.Errorf("confirm garbage: %d", r.status)
+	}
+	if r := e.post(e.client(nil), "wifi/confirm", "", []byte(colon)); r.status != 401 {
+		t.Errorf("confirm without client cert: %d", r.status)
+	}
+}
+
+func TestWifiProfile(t *testing.T) {
+	e := newEnv(t)
+	devTLS, _ := e.enrollDevice("alice")
+	get := func(c *http.Client) (int, string) {
+		req, _ := http.NewRequest(http.MethodGet, e.srv.URL+estPrefix+"wifi/profile", nil)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+	if code, _ := get(e.client(devTLS)); code != 404 {
+		t.Errorf("profile without configuration: %d", code)
+	}
+
+	e = newEnvWith(t, func(cfg map[string]any, dir string) {
+		cfg["wifi_profile"] = map[string]any{
+			"ssid": "Home Net ", "server_domain": "radius.example.org",
+			"server_ca_file": writeFile(t, dir, "radius-ca.pem", pemCert(e.root.cert)),
+		}
+	})
+	devTLS, _ = e.enrollDevice("alice")
+	if code, _ := get(e.client(nil)); code != 401 {
+		t.Errorf("profile without client cert: %d", code)
+	}
+	code, body := get(e.client(devTLS))
+	var p wifiProfile
+	if code != 200 || json.Unmarshal([]byte(body), &p) != nil {
+		t.Fatalf("profile: %d %s", code, body)
+	}
+	if p.SSID != "Home Net " || p.ServerDomain != "radius.example.org" || len(p.ServerCACertificates) != 1 {
+		t.Errorf("profile %+v", p)
+	}
+	if c, err := x509.ParseCertificate(p.ServerCACertificates[0]); err != nil || c.Subject.CommonName != "Test Root" {
+		t.Errorf("profile CA: %v", err)
 	}
 }

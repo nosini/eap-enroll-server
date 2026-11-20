@@ -18,6 +18,7 @@ import (
 	"os"
 	"regexp"
 	"time"
+	"unicode/utf8"
 )
 
 // Duration is a Go duration string ("2160h"). Text keeps the spelling
@@ -58,6 +59,15 @@ type OpenBao struct {
 	UserGroupsPath string `json:"user_groups_path"`
 }
 
+// WifiProfile is the network the phones configure: SSID (kept exactly,
+// spaces included), the RADIUS server's name and the CA that issued the
+// RADIUS server certificate.
+type WifiProfile struct {
+	SSID         string `json:"ssid"`
+	ServerDomain string `json:"server_domain"`
+	ServerCAFile string `json:"server_ca_file"`
+}
+
 // Config is the whole configuration file.
 type Config struct {
 	Listen            string   `json:"listen"`
@@ -73,7 +83,12 @@ type Config struct {
 	WifiTTL           Duration `json:"wifi_ttl"`
 	DeviceTTL         Duration `json:"device_ttl"`
 	OpenBao           OpenBao  `json:"openbao"`
+	// WifiProfile is optional; without it wifi/profile answers 404.
+	WifiProfile *WifiProfile `json:"wifi_profile"`
 }
+
+// hostname matches a DNS name (letters, digits, hyphens, dots).
+var hostname = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
 
 // pathSegment matches a mount, role or KV path: no empty segments, no "..".
 var pathSegment = regexp.MustCompile(`^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$`)
@@ -175,6 +190,15 @@ func (c *Config) validate() error {
 		if !pathSegment.MatchString(v) {
 			errs = append(errs, fmt.Errorf("openbao.%s %q is not a valid path", name, v))
 		}
+	}
+	if p := c.WifiProfile; p != nil {
+		if len(p.SSID) == 0 || len(p.SSID) > 32 || !utf8.ValidString(p.SSID) {
+			errs = append(errs, errors.New("wifi_profile.ssid must be 1-32 bytes of UTF-8"))
+		}
+		if !hostname.MatchString(p.ServerDomain) {
+			errs = append(errs, errors.New("wifi_profile.server_domain must be a DNS name"))
+		}
+		file("wifi_profile.server_ca_file", p.ServerCAFile, false)
 	}
 	if o.WifiMount == o.DeviceMount {
 		errs = append(errs, errors.New("openbao.wifi_mount and device_mount must differ"))
