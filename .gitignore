@@ -1,0 +1,7 @@
+/eap-enroll
+/build/
+*.local.md
+*.db
+*.db-wal
+*.db-shm
+AGENT-HANDOFF.md
