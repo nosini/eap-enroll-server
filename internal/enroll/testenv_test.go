@@ -134,6 +134,13 @@ type fakeBao struct {
 	wrongCN  bool // issue certificates with a different CN
 	failSign bool
 	failRot  bool
+	// mutate changes the template before the fake signs it, to make it
+	// issue a certificate the service should refuse.
+	mutate func(*x509.Certificate)
+	// signCA overrides the CA that signs, and emptyChain answers without
+	// issuing_ca or ca_chain.
+	signCA     *ca
+	emptyChain bool
 }
 
 const (
@@ -206,6 +213,9 @@ func (f *fakeBao) serve(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeBao) sign(w http.ResponseWriter, mount string, body map[string]any) {
 	issuer := f.cas[mount]
+	if f.signCA != nil {
+		issuer = f.signCA
+	}
 	if issuer == nil || f.failSign {
 		f.reply(w, 500, map[string]any{"errors": []string{"cannot sign"}})
 		return
@@ -236,13 +246,19 @@ func (f *fakeBao) sign(w http.ResponseWriter, mount string, body map[string]any)
 		parsed, _ := url.Parse(u)
 		tmpl.URIs = []*url.URL{parsed}
 	}
+	if f.mutate != nil {
+		f.mutate(tmpl)
+	}
 	cert := issue(f.t, issuer, tmpl, csr.PublicKey)
-	f.reply(w, 200, map[string]any{"data": map[string]any{
+	data := map[string]any{
 		"certificate":   pemCert(cert),
-		"issuing_ca":    pemCert(issuer.cert),
-		"ca_chain":      []string{pemCert(issuer.cert), pemCert(f.root.cert)},
 		"serial_number": colonHex(cert.SerialNumber),
-	}})
+	}
+	if !f.emptyChain {
+		data["issuing_ca"] = pemCert(issuer.cert)
+		data["ca_chain"] = []string{pemCert(issuer.cert), pemCert(f.root.cert)}
+	}
+	f.reply(w, 200, map[string]any{"data": data})
 }
 
 func colonHex(n *big.Int) string {
@@ -270,6 +286,7 @@ type env struct {
 	svc      *Service
 	store    *store.Store
 	srv      *httptest.Server
+	handler  http.Handler
 	now      time.Time
 	logs     *bytes.Buffer
 }
@@ -349,6 +366,7 @@ func newEnvWith(t *testing.T, change func(cfg map[string]any, dir string)) *env 
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.handler = handler
 	tlsConfig, err := e.svc.TLSConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -396,6 +414,17 @@ type result struct {
 func (e *env) post(client *http.Client, path, bearer string, body []byte) result {
 	e.t.Helper()
 	e.now = e.now.Add(time.Duration(float64(time.Second) / postRate))
+	return e.httpPost(client, path, bearer, body)
+}
+
+// postBurst is post without advancing the clock, so repeated requests
+// drain a token bucket.
+func (e *env) postBurst(client *http.Client, path, bearer string, body []byte) result {
+	e.t.Helper()
+	return e.httpPost(client, path, bearer, body)
+}
+
+func (e *env) httpPost(client *http.Client, path, bearer string, body []byte) result {
 	req, err := http.NewRequest(http.MethodPost, e.srv.URL+estPrefix+path, bytes.NewReader(body))
 	if err != nil {
 		e.t.Fatal(err)
@@ -405,6 +434,34 @@ func (e *env) post(client *http.Client, path, bearer string, body []byte) result
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	return e.do(client, req)
+}
+
+// postDirect sends a POST through the handler with a chosen client
+// address, without TLS. Only for endpoints that don't need a client
+// certificate.
+func (e *env) postDirect(remote, path, bearer string, body []byte) result {
+	e.t.Helper()
+	req := httptest.NewRequest(http.MethodPost, estPrefix+path, bytes.NewReader(body))
+	req.RemoteAddr = remote
+	req.Header.Set("Content-Type", "application/pkcs10")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	rec := httptest.NewRecorder()
+	e.handler.ServeHTTP(rec, req)
+	return result{status: rec.Code, body: rec.Body.String(), header: rec.Header()}
+}
+
+// events counts the log lines for an event.
+func (e *env) events(name string) int {
+	n := 0
+	for _, line := range strings.Split(e.logs.String(), "\n") {
+		var v map[string]any
+		if json.Unmarshal([]byte(line), &v) == nil && v["msg"] == name {
+			n++
+		}
+	}
+	return n
 }
 
 func (e *env) do(client *http.Client, req *http.Request) result {

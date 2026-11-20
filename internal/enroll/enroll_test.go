@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,8 +137,11 @@ func TestFullLifecycle(t *testing.T) {
 	if !contains(e.bao.revoked["pki-enroll"], colonHex(devCert.SerialNumber)) || e.bao.rotates["pki-enroll"] != 1 {
 		t.Errorf("old device credential not revoked: %v %v", e.bao.revoked, e.bao.rotates)
 	}
-	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 401 {
-		t.Errorf("old credential after the new one was used: %d", r.status)
+	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 || !strings.Contains(r.body, "device is disabled") {
+		t.Errorf("old credential after the new one was used: %d %s", r.status, r.body)
+	}
+	if e.events("credential_reuse") != 1 {
+		t.Errorf("credential_reuse logged %d times", e.events("credential_reuse"))
 	}
 
 	// No client certificate.
@@ -145,7 +149,8 @@ func TestFullLifecycle(t *testing.T) {
 		t.Errorf("wifi without client cert: %d", r.status)
 	}
 
-	// Disable: blocks at once, revokes the rest, rotates both CRLs.
+	// The reuse detection disabled the device and revoked the rest;
+	// disabling again revokes nothing new.
 	remaining, err := e.svc.DisableDevice(ctx, deviceID)
 	if err != nil || len(remaining) != 0 {
 		t.Fatalf("disable: %v %v", remaining, err)
@@ -242,26 +247,55 @@ func TestCodeFailures(t *testing.T) {
 
 func TestCodeRateLimit(t *testing.T) {
 	e := newEnv(t)
-	c := e.client(nil)
 	body := csrBody(t, newKey(t, elliptic.P256()), "x")
-	good := e.code("alice", "Phone")
+	const remote = "192.0.2.10:1234"
+	// Five wrong codes use up the burst of the client's token bucket and
+	// block the key.
 	for i := 0; i < codeFailLimit; i++ {
-		if r := e.post(c, "device/simpleenroll", "WRONGCODE", body); r.status != 401 {
+		if r := e.postDirect(remote, "device/simpleenroll", "WRONGCODE", body); r.status != 401 {
 			t.Fatalf("wrong code %d: %d", i, r.status)
 		}
 	}
-	r := e.post(c, "device/simpleenroll", good, body)
-	if r.status != 429 || r.header.Get("Retry-After") == "" {
-		t.Fatalf("after %d failures: %d", codeFailLimit, r.status)
+	// The bucket is empty now.
+	if r := e.postDirect(remote, "device/simpleenroll", "WRONGCODE", body); r.status != 429 || r.header.Get("Retry-After") == "" {
+		t.Fatalf("empty bucket: %d", r.status)
 	}
-	e.now = e.now.Add(codeBlock)
-	if r := e.post(c, "device/simpleenroll", e.code("alice", "Phone"), body); r.status != 200 {
-		t.Errorf("after the block: %d %s", r.status, r.body)
+	// A valid code bypasses the block and the empty bucket.
+	if r := e.postDirect(remote, "device/simpleenroll", e.code("alice", "Phone"), body); r.status != 200 {
+		t.Errorf("valid code from a blocked client: %d %s", r.status, r.body)
+	}
+	// Once the bucket has refilled, the block still refuses wrong codes,
+	// but not a valid one.
+	e.now = e.now.Add(time.Minute)
+	if r := e.postDirect(remote, "device/simpleenroll", "WRONGCODE", body); r.status != 429 {
+		t.Errorf("blocked code: %d", r.status)
+	}
+	if r := e.postDirect(remote, "device/simpleenroll", e.code("alice", "Phone"), body); r.status != 200 {
+		t.Errorf("valid code while blocked: %d %s", r.status, r.body)
+	}
+}
+
+func TestGlobalCodeFailuresWarning(t *testing.T) {
+	e := newEnv(t)
+	body := csrBody(t, newKey(t, elliptic.P256()), "x")
+	// Failures from many client keys only log one warning and don't stop
+	// code enrollment for anyone.
+	for i := 0; i < globalFailLimit+5; i++ {
+		remote := "192.0.2." + strconv.Itoa(i) + ":1234"
+		if r := e.postDirect(remote, "device/simpleenroll", "WRONGCODE", body); r.status != 401 {
+			t.Fatalf("wrong code %d: %d", i, r.status)
+		}
+	}
+	if n := e.events("code_failures_high"); n != 1 {
+		t.Errorf("code_failures_high logged %d times, want 1", n)
+	}
+	if r := e.post(e.client(nil), "device/simpleenroll", e.code("alice", "Phone"), body); r.status != 200 {
+		t.Errorf("valid code after many failures: %d %s", r.status, r.body)
 	}
 }
 
 func TestLimiter(t *testing.T) {
-	l := newLimiter()
+	l := newLimiter(postBurst)
 	now := time.Now()
 	for i := 0; i < postBurst; i++ {
 		if ok, _ := l.allow("a", now); !ok {
@@ -277,15 +311,85 @@ func TestLimiter(t *testing.T) {
 	if ok, _ := l.allow("a", now.Add(7*time.Second)); !ok {
 		t.Error("token not refilled")
 	}
-	// Global cap on wrong codes.
+	// Wrong codes from all clients only warn, once per window.
+	warned := 0
+	for i := 0; i < globalFailLimit+5; i++ {
+		if l.codeFailed("192.0.2.5", now) {
+			warned++
+		}
+	}
+	if warned != 1 {
+		t.Errorf("global warning %d times, want 1", warned)
+	}
+	if ok, _ := l.codeAllowed("fresh", now); !ok {
+		t.Error("global failures refuse a fresh client")
+	}
+	warned = 0
 	for i := 0; i < globalFailLimit; i++ {
-		l.codeFailed(clientKey("192.0.2."+string(rune('0'+i%10))+":1"), now)
+		if l.codeFailed("192.0.2.6", now.Add(globalFailWindow)) {
+			warned++
+		}
 	}
-	if ok, _ := l.codeAllowed("fresh", now); ok {
-		t.Error("global failure cap not applied")
+	if warned != 1 {
+		t.Error("global warning not logged again in a new window")
 	}
-	if ok, _ := l.codeAllowed("fresh", now.Add(globalFailWindow)); !ok {
-		t.Error("global cap not lifted after the window")
+}
+
+func TestLimiterFull(t *testing.T) {
+	now := time.Now()
+	l := newLimiter(postBurst)
+	l.max = 3
+	for _, k := range []string{"a", "b", "c"} {
+		if ok, _ := l.allow(k, now); !ok {
+			t.Fatalf("%s refused", k)
+		}
+	}
+	// A full map makes room instead of refusing a new key.
+	if ok, _ := l.allow("d", now); !ok {
+		t.Fatal("new key refused when the map is full")
+	}
+	if len(l.clients) != 3 {
+		t.Errorf("map holds %d entries, want 3", len(l.clients))
+	}
+	// Full and idle: entries are swept at once.
+	now = now.Add(idleExpiry + time.Minute)
+	if ok, _ := l.allow("e", now); !ok {
+		t.Error("new key refused after idle sweep")
+	}
+	if len(l.clients) != 1 {
+		t.Errorf("idle entries not swept: %d left", len(l.clients))
+	}
+
+	// Blocked entries are evicted last.
+	l = newLimiter(postBurst)
+	l.max = 2
+	l.allow("blocked", now)
+	for i := 0; i < codeFailLimit; i++ {
+		l.codeFailed("blocked", now)
+	}
+	l.allow("idle", now)
+	if ok, _ := l.allow("new", now); !ok {
+		t.Fatal("new key refused")
+	}
+	if l.clients["blocked"] == nil {
+		t.Error("blocked entry evicted")
+	}
+	if l.clients["idle"] != nil {
+		t.Error("unblocked entry not evicted first")
+	}
+	if l.clients["new"] == nil {
+		t.Error("new entry missing")
+	}
+
+	// Even a map full of blocked entries takes a new key.
+	l = newLimiter(postBurst)
+	l.max = 1
+	l.allow("one", now)
+	for i := 0; i < codeFailLimit; i++ {
+		l.codeFailed("one", now)
+	}
+	if ok, _ := l.allow("two", now); !ok {
+		t.Error("new key refused when all entries are blocked")
 	}
 }
 
@@ -332,13 +436,14 @@ func TestForeignClientCertificates(t *testing.T) {
 		t.Errorf("unrecorded device cert: %d", r.status)
 	}
 
-	// Revoked device credential.
+	// A revoked device credential of an enabled device is a superseded
+	// one being reused: the device is disabled.
 	if err := e.store.MarkRevoked(context.Background(), store.KindDevice,
 		openbao.SerialText(devCert.SerialNumber), e.now); err != nil {
 		t.Fatal(err)
 	}
-	if r := e.post(e.client(devTLS), "wifi/simpleenroll", "", body); r.status != 401 {
-		t.Errorf("revoked device cert: %d", r.status)
+	if r := e.post(e.client(devTLS), "wifi/simpleenroll", "", body); r.status != 403 || !strings.Contains(r.body, "device is disabled") {
+		t.Errorf("revoked device cert: %d %s", r.status, r.body)
 	}
 }
 

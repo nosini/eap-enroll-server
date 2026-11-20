@@ -88,7 +88,6 @@ field dev2 -ext subjectAltName | grep -q "urn:uuid:$DEVID" && ok "renewed creden
 check "wifi/profile" 200 "$(est profile wifi/profile -X GET --cert "$W/dev2.pem" --key "$W/dev2.key")"
 python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(p["ssid"] != "Test Net" or p["server_domain"] != "radius.example.org")' "$W/profile.out" \
   && ok "profile content" || bad "profile $(cat "$W/profile.out")"
-check "old device credential after the new one was used" 401 "$(est old wifi/simpleenroll --cert "$W/dev.pem" --key "$W/dev.key" --data-binary @"$W/wifi.csr")"
 
 # A second Wi-Fi certificate; confirming it revokes the first.
 check "second wifi/simpleenroll" 200 "$(est wifi2 wifi/simpleenroll --cert "$W/dev2.pem" --key "$W/dev2.key" --data-binary @"$W/wifi.csr")"
@@ -133,6 +132,9 @@ check "policy: device sign" allowed "$(pol pki-enroll/sign/device csr=@"$W/p.csr
 check "policy: device without uri_sans" denied "$(pol pki-enroll/sign/device csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true ttl=8760h)"
 check "role: device URI outside urn:uuid" http-400 "$(pol pki-enroll/sign/device csr=@"$W/p.csr" common_name=alice uri_sans=https://evil.example exclude_cn_from_sans=true ttl=8760h)"
 check "role: CN outside allowed_domains" http-400 "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=mallory exclude_cn_from_sans=true ttl=1440h)"
+check "policy: no default policy (cubbyhole)" denied "$(pol cubbyhole/test a=b)"
+check "policy: revoke-self" allowed "$(pol auth/token/revoke-self)"
+check "policy: revoked token" denied "$(pol pki-radius/sign/eap-client csr=@"$W/p.csr" common_name=alice exclude_cn_from_sans=true ttl=1440h)"
 check "approle: CIDR binding" denied "$(bao write -field=token auth/approle/login role_id=@state/elsewhere-role-id secret_id=@state/elsewhere-secret-id >/dev/null 2>&1 && echo allowed || echo denied)"
 
 # Rate limit: burst of 5 from one address.
@@ -163,9 +165,40 @@ curl -s --cacert baotls/vault-ca.pem https://127.0.0.1:8200/v1/pki-enroll/crl/pe
 check "device CRL entries" 2 "$(openssl crl -in "$W/enroll.crl" -noout -text | grep -c 'Serial Number')"
 bin/eap-enroll devices -config "$CFG" 2>>state/admin.log
 
+# Reusing a superseded device credential disables the device.
+URI2=$(bin/eap-enroll code -config "$CFG" -user carol -label "Reuse test" 2>>state/admin.log)
+CODE2=$(python3 -c 'import sys,urllib.parse as u; print(u.parse_qs(u.urlparse(sys.argv[1]).query)["code"][0])' "$URI2")
+csr r1 prime256v1
+check "reuse: enroll" 200 "$(est r1 device/simpleenroll -H "Authorization: Bearer $CODE2" --data-binary @"$W/r1.csr")"
+certs r1
+csr r2 prime256v1
+check "reuse: renew" 200 "$(est r2 device/simplereenroll --cert "$W/r1.pem" --key "$W/r1.key" --data-binary @"$W/r2.csr")"
+certs r2
+check "reuse: new credential" 200 "$(est r2p wifi/profile -X GET --cert "$W/r2.pem" --key "$W/r2.key")"
+check "reuse: old credential" 403 "$(est r1old wifi/profile -X GET --cert "$W/r1.pem" --key "$W/r1.key")"
+check "reuse: new credential after reuse" 403 "$(est r2late wifi/profile -X GET --cert "$W/r2.pem" --key "$W/r2.key")"
+curl -s --cacert baotls/vault-ca.pem https://127.0.0.1:8200/v1/pki-enroll/crl/pem >"$W/enroll2.crl"
+openssl crl -in "$W/enroll2.crl" -noout -text | tr -d ' :' | grep -qi "SerialNumber$(field r2 -serial | cut -d= -f2)" \
+  && ok "reuse: new credential on the CRL" || bad "reuse: new credential not on the CRL"
+grep -q '"msg":"credential_reuse"' state/serve.log && ok "reuse: logged" || bad "reuse: not logged"
+
 # Logs must not contain the code or the secret ID.
-grep -q "$CODE" state/serve.log state/admin.log && bad "code in logs" || ok "code not in logs"
+grep -qe "$CODE" -e "$CODE2" state/serve.log state/admin.log && bad "code in logs" || ok "code not in logs"
 grep -qf state/secret-id state/serve.log state/admin.log && bad "secret ID in logs" || ok "secret ID not in logs"
 
+# The service and the admin commands revoke their tokens when they exit.
 pkill -f "[e]ap-enroll serve"
+for _ in $(seq 40); do pgrep -f "[e]ap-enroll serve" >/dev/null || break; sleep 0.25; done
+left=$(BAO_TOKEN=root python3 - <<'EOF'
+import json, subprocess
+run = lambda *a: subprocess.run(["bao", *a], capture_output=True, text=True)
+n = 0
+for a in json.loads(run("list", "-format=json", "auth/token/accessors").stdout):
+    r = run("write", "-format=json", "auth/token/lookup-accessor", "accessor=" + a)
+    if r.returncode == 0 and json.loads(r.stdout)["data"].get("path", "").startswith("auth/approle/"):
+        n += 1
+print(n)
+EOF
+)
+check "no AppRole tokens left" 0 "$left"
 echo "failures: $fails"

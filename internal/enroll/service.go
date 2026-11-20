@@ -7,12 +7,15 @@
 package enroll
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/pem"
@@ -26,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/nosini/eap-enroll-server/internal/attest"
 	"github.com/nosini/eap-enroll-server/internal/config"
 	"github.com/nosini/eap-enroll-server/internal/openbao"
 	"github.com/nosini/eap-enroll-server/internal/store"
@@ -62,15 +66,24 @@ func fail(status int, reason, message string, err error) *Failure {
 	return &Failure{Status: status, Reason: reason, Message: message, Err: err}
 }
 
+// tooManyCertificatesRetry is the Retry-After the client gets when its
+// device has reached an issuance cap.
+const tooManyCertificatesRetry = 3600
+
 // Service holds what the handlers and admin commands need.
 type Service struct {
-	cfg         *config.Config
-	store       *store.Store
-	bao         *openbao.Client
-	log         *slog.Logger
-	now         func() time.Time
-	fingerprint string
-	limits      *limiter
+	cfg           *config.Config
+	store         *store.Store
+	bao           *openbao.Client
+	log           *slog.Logger
+	now           func() time.Time
+	fingerprint   string
+	limits        *limiter // per client address
+	devices       *limiter // per device, for authenticated requests
+	wifiIssuers   []*x509.Certificate
+	deviceIssuers []*x509.Certificate
+	attestation   *attest.Policy
+	attestStatus  *attest.StatusList
 }
 
 // New creates the service.
@@ -79,7 +92,45 @@ func New(cfg *config.Config, st *store.Store, bao *openbao.Client, log *slog.Log
 	if err != nil {
 		return nil, err
 	}
-	return &Service{cfg: cfg, store: st, bao: bao, log: log, now: time.Now, fingerprint: fp, limits: newLimiter()}, nil
+	wifiIssuers, err := config.ReadCertificates(cfg.WifiCACertsFile)
+	if err != nil {
+		return nil, err
+	}
+	deviceIssuers, err := config.ReadCertificates(cfg.DeviceCAFile)
+	if err != nil {
+		return nil, err
+	}
+	var attPolicy *attest.Policy
+	var attStatus *attest.StatusList
+	if ka := cfg.KeyAttestation; ka != nil {
+		roots, err := config.ReadCertificates(ka.RootsFile)
+		if err != nil {
+			return nil, err
+		}
+		attPolicy = &attest.Policy{
+			Roots:            roots,
+			RequireStrongBox: ka.RequireStrongBox,
+			VerifiedBootKeys: ka.VerifiedBootKeys,
+			AppPackage:       ka.AppPackage,
+			AppSigningCerts:  ka.AppSigningCerts,
+		}
+		attStatus, err = attest.NewStatusList(ka.StatusURL, log)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &Service{
+		cfg: cfg, store: st, bao: bao, log: log, now: time.Now, fingerprint: fp,
+		limits: newLimiter(postBurst), devices: newLimiter(deviceBurst),
+		wifiIssuers: wifiIssuers, deviceIssuers: deviceIssuers,
+		attestation: attPolicy, attestStatus: attStatus,
+	}, nil
+}
+
+// RunAttestationStatus refreshes the optional revocation list until ctx
+// ends. It is a no-op without a status URL.
+func (s *Service) RunAttestationStatus(ctx context.Context) {
+	s.attestStatus.Run(ctx)
 }
 
 func hashCode(code string) []byte {
@@ -129,22 +180,31 @@ func newDeviceID() string {
 
 // profile is one of the two certificate kinds.
 type profile struct {
-	kind   string
-	mount  string
-	role   string
-	ttl    string
-	curves []elliptic.Curve
+	kind    string
+	mount   string
+	role    string
+	ttl     string
+	ttlD    time.Duration
+	curves  []elliptic.Curve
+	issuers []*x509.Certificate
 }
 
 func (s *Service) wifiProfile() profile {
 	o := s.cfg.OpenBao
-	return profile{store.KindWifi, o.WifiMount, o.WifiRole, s.cfg.WifiTTL.Text, []elliptic.Curve{elliptic.P384()}}
+	return profile{
+		kind: store.KindWifi, mount: o.WifiMount, role: o.WifiRole,
+		ttl: s.cfg.WifiTTL.Text, ttlD: s.cfg.WifiTTL.D,
+		curves: []elliptic.Curve{elliptic.P384()}, issuers: s.wifiIssuers,
+	}
 }
 
 func (s *Service) deviceProfile() profile {
 	o := s.cfg.OpenBao
-	return profile{store.KindDevice, o.DeviceMount, o.DeviceRole, s.cfg.DeviceTTL.Text,
-		[]elliptic.Curve{elliptic.P256(), elliptic.P384()}}
+	return profile{
+		kind: store.KindDevice, mount: o.DeviceMount, role: o.DeviceRole,
+		ttl: s.cfg.DeviceTTL.Text, ttlD: s.cfg.DeviceTTL.D,
+		curves: []elliptic.Curve{elliptic.P256(), elliptic.P384()}, issuers: s.deviceIssuers,
+	}
 }
 
 func (s *Service) mountOf(kind string) string {
@@ -186,9 +246,21 @@ func parseCSR(body []byte, p profile) (*x509.CertificateRequest, error) {
 	return csr, nil
 }
 
+// Subject attribute types the service allows in issued certificates.
+var (
+	oidCommonName         = asn1.ObjectIdentifier{2, 5, 4, 3}
+	oidCountry            = asn1.ObjectIdentifier{2, 5, 4, 6}
+	oidLocality           = asn1.ObjectIdentifier{2, 5, 4, 7}
+	oidProvince           = asn1.ObjectIdentifier{2, 5, 4, 8}
+	oidOrganization       = asn1.ObjectIdentifier{2, 5, 4, 10}
+	oidOrganizationalUnit = asn1.ObjectIdentifier{2, 5, 4, 11}
+	oidSubjectAltName     = asn1.ObjectIdentifier{2, 5, 29, 17}
+)
+
 // checkIssued makes sure OpenBao issued what was asked for before the
-// certificate is recorded or handed out.
-func checkIssued(signed *openbao.Signed, csr *x509.CertificateRequest, username, uri string) error {
+// certificate is recorded or handed out. The configured issuers come from
+// the service's own configuration, not from OpenBao's answer.
+func checkIssued(signed *openbao.Signed, csr *x509.CertificateRequest, username, uri string, p profile, now time.Time) error {
 	c := signed.Certificate
 	if c.Subject.CommonName != username {
 		return fmt.Errorf("issued CN %q, expected %q", c.Subject.CommonName, username)
@@ -208,12 +280,23 @@ func checkIssued(signed *openbao.Signed, csr *x509.CertificateRequest, username,
 	if len(c.DNSNames)+len(c.EmailAddresses)+len(c.IPAddresses) != 0 {
 		return errors.New("issued certificate has DNS, e-mail or IP SANs")
 	}
-	var uris []string
-	for _, u := range c.URIs {
-		uris = append(uris, u.String())
+	if err := checkSAN(c, uri); err != nil {
+		return err
 	}
-	if (uri == "" && len(uris) != 0) || (uri != "" && (len(uris) != 1 || uris[0] != uri)) {
-		return fmt.Errorf("issued URI SANs %v, expected %q", uris, uri)
+	if err := checkSubject(c); err != nil {
+		return err
+	}
+	if len(c.UnhandledCriticalExtensions) != 0 {
+		return fmt.Errorf("issued certificate has unhandled critical extensions %v", c.UnhandledCriticalExtensions)
+	}
+	if !c.NotAfter.After(now) {
+		return errors.New("issued certificate is already expired")
+	}
+	if c.NotAfter.After(now.Add(p.ttlD + 5*time.Minute)) {
+		return fmt.Errorf("issued certificate expires %v, after the profile's TTL", c.NotAfter.UTC())
+	}
+	if err := checkIssuer(c, p.issuers); err != nil {
+		return err
 	}
 	if len(signed.Chain) > 0 {
 		if err := c.CheckSignatureFrom(signed.Chain[0]); err != nil {
@@ -221,6 +304,86 @@ func checkIssued(signed *openbao.Signed, csr *x509.CertificateRequest, username,
 		}
 	}
 	return nil
+}
+
+// checkSAN parses the raw subjectAltName extension. Wi-Fi certificates
+// have no SAN or no names in it; device credentials have exactly the
+// device URI. Any other name type is an error, including otherName (UPN),
+// directory names and registered IDs.
+func checkSAN(c *x509.Certificate, uri string) error {
+	var ext *pkix.Extension
+	for i := range c.Extensions {
+		if c.Extensions[i].Id.Equal(oidSubjectAltName) {
+			ext = &c.Extensions[i]
+			break
+		}
+	}
+	if ext == nil {
+		if uri != "" {
+			return fmt.Errorf("issued certificate has no URI SAN, expected %q", uri)
+		}
+		return nil
+	}
+	var names asn1.RawValue
+	if rest, err := asn1.Unmarshal(ext.Value, &names); err != nil || len(rest) != 0 ||
+		names.Class != asn1.ClassUniversal || names.Tag != asn1.TagSequence {
+		return errors.New("issued certificate has a malformed subjectAltName")
+	}
+	var got []string
+	rest := names.Bytes
+	for len(rest) > 0 {
+		var gn asn1.RawValue
+		var err error
+		if rest, err = asn1.Unmarshal(rest, &gn); err != nil {
+			return errors.New("issued certificate has a malformed subjectAltName")
+		}
+		if gn.Class != asn1.ClassContextSpecific || gn.Tag != 6 {
+			return fmt.Errorf("issued certificate has an unexpected SAN type (class %d, tag %d)", gn.Class, gn.Tag)
+		}
+		got = append(got, string(gn.Bytes))
+	}
+	if uri == "" {
+		if len(got) != 0 {
+			return fmt.Errorf("issued certificate has SANs %v, expected none", got)
+		}
+		return nil
+	}
+	if len(got) != 1 || got[0] != uri {
+		return fmt.Errorf("issued URI SANs %v, expected %q", got, uri)
+	}
+	return nil
+}
+
+// checkSubject requires exactly one CN and only CN, C, L, ST, O and OU
+// attributes, so no UID, serialNumber or other identifying attribute gets
+// through.
+func checkSubject(c *x509.Certificate) error {
+	cn := 0
+	for _, atv := range c.Subject.Names {
+		switch {
+		case atv.Type.Equal(oidCommonName):
+			cn++
+		case atv.Type.Equal(oidCountry), atv.Type.Equal(oidLocality), atv.Type.Equal(oidProvince),
+			atv.Type.Equal(oidOrganization), atv.Type.Equal(oidOrganizationalUnit):
+		default:
+			return fmt.Errorf("issued certificate has unexpected subject attribute %v", atv.Type)
+		}
+	}
+	if cn != 1 {
+		return fmt.Errorf("issued certificate has %d CN attributes, expected exactly one", cn)
+	}
+	return nil
+}
+
+// checkIssuer requires the certificate to be signed by one of the
+// configured CA certificates, independently of OpenBao's returned chain.
+func checkIssuer(c *x509.Certificate, issuers []*x509.Certificate) error {
+	for _, ca := range issuers {
+		if bytes.Equal(c.RawIssuer, ca.RawSubject) && c.CheckSignatureFrom(ca) == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("issued certificate isn't signed by a configured CA (issuer %q)", c.Issuer)
 }
 
 // sign checks the user, signs the CSR, checks the result and records it.
@@ -232,6 +395,12 @@ func (s *Service) sign(ctx context.Context, p profile, dev store.Device, csr *x5
 	}
 	if err != nil {
 		return nil, fail(502, "openbao_error", "certificate authority unavailable", err)
+	}
+	if err := s.store.CheckCertificateLimit(ctx, dev.ID, p.kind, s.now()); err != nil {
+		if errors.Is(err, store.ErrTooManyCertificates) {
+			return nil, fail(429, "too_many_certificates", "too many certificates for this device", nil)
+		}
+		return nil, fail(500, "store_error", "internal error", err)
 	}
 	req := openbao.SignRequest{
 		CSR:               string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csr.Raw})),
@@ -249,7 +418,7 @@ func (s *Service) sign(ctx context.Context, p profile, dev store.Device, csr *x5
 		return nil, fail(502, "openbao_error", "certificate authority unavailable", err)
 	}
 	serial := openbao.SerialText(signed.Certificate.SerialNumber)
-	if err := checkIssued(signed, csr, name, uri); err != nil {
+	if err := checkIssued(signed, csr, name, uri, p, s.now()); err != nil {
 		s.revokeUnrecorded(ctx, p.mount, serial)
 		return nil, fail(502, "openbao_wrong_certificate", "certificate authority error", err)
 	}
@@ -259,8 +428,11 @@ func (s *Service) sign(ctx context.Context, p profile, dev store.Device, csr *x5
 	})
 	if err != nil {
 		s.revokeUnrecorded(ctx, p.mount, serial)
-		if errors.Is(err, store.ErrDeviceDisabled) {
+		switch {
+		case errors.Is(err, store.ErrDeviceDisabled):
 			return nil, fail(403, "device_disabled", "device is disabled", nil)
+		case errors.Is(err, store.ErrTooManyCertificates):
+			return nil, fail(429, "too_many_certificates", "too many certificates for this device", nil)
 		}
 		return nil, fail(500, "store_error", "internal error", err)
 	}
@@ -344,7 +516,22 @@ func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certifica
 		return dev, "", fail(500, "store_error", "internal error", err)
 	}
 	if cert.Revoked != nil {
-		return dev, "", fail(401, "revoked_cert", "client certificate revoked", nil)
+		// The device is enabled here, so the only way its credential was
+		// revoked is revokeOlder: a newer credential replaced it. Using a
+		// superseded credential means a copy exists (or the phone kept
+		// using the old one), so someone other than the owner may hold a
+		// valid credential. Disable the device; the owner gets a new code
+		// and the copy stops working. Expired credentials are handled
+		// below and stay a plain 401.
+		s.log.Error("credential_reuse", "device", dev.ID, "username", dev.Username,
+			"label", dev.Label, "serial", serial)
+		remaining, err := s.DisableDevice(context.WithoutCancel(ctx), dev.ID)
+		if err != nil {
+			// The device is disabled anyway; an admin reruns
+			// `eap-enroll disable` to revoke the rest.
+			s.log.Error("revoke_failed", "device", dev.ID, "serials", remaining, "error", err.Error())
+		}
+		return dev, "", fail(403, "credential_reuse", "device is disabled", nil)
 	}
 	if !s.now().Before(cert.NotAfter) {
 		return dev, "", fail(401, "expired_cert", "client certificate expired", nil)

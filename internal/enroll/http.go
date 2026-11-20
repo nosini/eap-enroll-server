@@ -6,6 +6,8 @@ package enroll
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -22,12 +24,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nosini/eap-enroll-server/internal/attest"
 	"github.com/nosini/eap-enroll-server/internal/config"
+	"github.com/nosini/eap-enroll-server/internal/openbao"
 	"github.com/nosini/eap-enroll-server/internal/store"
 )
 
 // maxBody bounds an EST request body (a base64 CSR is well below 2 KiB).
 const maxBody = 16 << 10
+
+// maxAttestationHeader matches the server's MaxHeaderBytes. A larger
+// header is refused with 400 rather than reaching the TLS stack.
+const maxAttestationHeader = 16 << 10
 
 const estPrefix = "/.well-known/est/"
 
@@ -107,6 +115,9 @@ func (s *Service) refuse(w http.ResponseWriter, r *http.Request, event string, e
 		level = slog.LevelError
 	}
 	s.log.Log(r.Context(), level, event+"_refused", attrs...)
+	if f.Reason == "too_many_certificates" {
+		w.Header().Set("Retry-After", strconv.Itoa(tooManyCertificatesRetry))
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(f.Status)
@@ -135,6 +146,59 @@ func readCSR(w http.ResponseWriter, r *http.Request, p profile) (*x509.Certifica
 	return csr, nil
 }
 
+// attestationChain parses the Key-Attestation header: standard base64
+// of the concatenated DER certificates, leaf first.
+func attestationChain(r *http.Request) ([]*x509.Certificate, error) {
+	h := r.Header.Get("Key-Attestation")
+	if h == "" {
+		return nil, errors.New("missing Key-Attestation header")
+	}
+	if len(h) > maxAttestationHeader {
+		return nil, fmt.Errorf("Key-Attestation header is longer than %d bytes", maxAttestationHeader)
+	}
+	if strings.ContainsAny(h, "\r\n") {
+		return nil, errors.New("Key-Attestation header contains a line break")
+	}
+	der, err := base64.StdEncoding.Strict().DecodeString(h)
+	if err != nil {
+		return nil, fmt.Errorf("Key-Attestation header is not standard base64: %w", err)
+	}
+	certs, err := x509.ParseCertificates(der)
+	if err != nil {
+		return nil, fmt.Errorf("Key-Attestation header is not a certificate chain: %w", err)
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("Key-Attestation header has no certificates")
+	}
+	return certs, nil
+}
+
+func (s *Service) verifyAttestation(r *http.Request, pub crypto.PublicKey, challenge []byte) (attest.Result, error) {
+	chain, err := attestationChain(r)
+	if err != nil {
+		return attest.Result{}, fail(400, "bad_attestation", "invalid key attestation", err)
+	}
+	res, err := attest.Verify(chain, pub, challenge, *s.attestation, s.attestStatus, s.now())
+	if err != nil {
+		if errors.Is(err, attest.ErrStatusUnavailable) {
+			return attest.Result{}, fail(502, "attestation_status_unavailable",
+				"key attestation status unavailable", err)
+		}
+		return attest.Result{}, fail(403, "attestation_refused", "key attestation refused", err)
+	}
+	return res, nil
+}
+
+func attestationLogAttrs(res attest.Result) []any {
+	return []any{
+		"attestation_security_level", res.SecurityLevel,
+		"attestation_verified_boot_state", res.VerifiedBootState,
+		"attestation_device_locked", res.DeviceLocked,
+		"attestation_verified_boot_key", res.VerifiedBootKey,
+		"attestation_version", res.AttestationVersion,
+	}
+}
+
 func (s *Service) respond(w http.ResponseWriter, certs []*x509.Certificate) {
 	body, err := encodeCerts(certs)
 	if err != nil {
@@ -158,10 +222,16 @@ func bearer(r *http.Request) (string, bool) {
 	return value, value != ""
 }
 
-func (s *Service) handleDeviceEnroll(w http.ResponseWriter, r *http.Request) {
-	const event = "enroll_device"
-	key := clientKey(r.RemoteAddr)
-	now := s.now()
+// codeFailed records a wrong, used or expired code and logs the one
+// global warning per window when the failure count gets high.
+func (s *Service) codeFailed(key string, now time.Time) {
+	if s.limits.codeFailed(key, now) {
+		s.log.Warn("code_failures_high", "count", globalFailLimit, "window", globalFailWindow.String())
+	}
+}
+
+// refuseCode answers an unusable code after charging the per-IP limits.
+func (s *Service) refuseCode(w http.ResponseWriter, r *http.Request, event, key string, now time.Time, f *Failure) {
 	if ok, wait := s.limits.allow(key, now); !ok {
 		s.rateLimited(w, r, event, wait)
 		return
@@ -170,9 +240,41 @@ func (s *Service) handleDeviceEnroll(w http.ResponseWriter, r *http.Request) {
 		s.rateLimited(w, r, event, wait)
 		return
 	}
+	s.codeFailed(key, now)
+	s.refuse(w, r, event, f)
+}
+
+func (s *Service) handleDeviceEnroll(w http.ResponseWriter, r *http.Request) {
+	const event = "enroll_device"
+	key := clientKey(r.RemoteAddr)
+	now := s.now()
 	code, ok := bearer(r)
 	if !ok {
+		// No code: the per-IP bucket still applies to this unauthenticated
+		// request.
+		if ok, wait := s.limits.allow(key, now); !ok {
+			s.rateLimited(w, r, event, wait)
+			return
+		}
 		s.refuse(w, r, event, fail(401, "no_code", "one-time code required", nil))
+		return
+	}
+	switch err := s.store.CheckCode(r.Context(), hashCode(code), now); {
+	case err == nil:
+		// A usable code is an unguessable secret, so it bypasses the
+		// per-IP limits: they would only lock out the user behind a
+		// shared address.
+	case errors.Is(err, store.ErrCodeInvalid):
+		s.refuseCode(w, r, event, key, now, fail(401, "bad_code", "invalid code", nil))
+		return
+	case errors.Is(err, store.ErrCodeUsed):
+		s.refuseCode(w, r, event, key, now, fail(401, "code_used", "invalid code", nil))
+		return
+	case errors.Is(err, store.ErrCodeExpired):
+		s.refuseCode(w, r, event, key, now, fail(401, "code_expired", "invalid code", nil))
+		return
+	default:
+		s.refuse(w, r, event, fail(500, "store_error", "internal error", err))
 		return
 	}
 	// A bad CSR doesn't use up the code.
@@ -181,35 +283,60 @@ func (s *Service) handleDeviceEnroll(w http.ResponseWriter, r *http.Request) {
 		s.refuse(w, r, event, err)
 		return
 	}
+	var attResult attest.Result
+	if s.attestation != nil {
+		// Checked before the code is used, so a refused attestation
+		// doesn't consume it.
+		attResult, err = s.verifyAttestation(r, csr.PublicKey, hashCode(code))
+		if err != nil {
+			s.refuse(w, r, event, err)
+			return
+		}
+	}
 	dev, certs, err := s.EnrollDevice(r.Context(), code, csr)
 	if err != nil {
 		var f *Failure
 		if errors.As(err, &f) && f.Status == 401 {
-			s.limits.codeFailed(key, s.now())
+			// The code became unusable since CheckCode: lost a race.
+			s.codeFailed(key, s.now())
 		}
 		s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username, "label", dev.Label)
 		return
 	}
-	s.log.Info(event, "remote", r.RemoteAddr, "device", dev.ID, "username", dev.Username, "label", dev.Label)
+	attrs := []any{"remote", r.RemoteAddr, "device", dev.ID, "username", dev.Username, "label", dev.Label}
+	if s.attestation != nil {
+		attrs = append(attrs, attestationLogAttrs(attResult)...)
+	}
+	s.log.Info(event, attrs...)
 	s.respond(w, certs)
 }
 
-// authenticated wraps a handler that needs the device credential: rate
-// limit, client certificate check, and retiring older device credentials
-// once a newer one is in use.
+// authenticated wraps a handler that needs the device credential:
+// authentication, a per-device rate limit, the user check, and retiring
+// older device credentials once a newer one is in use.
 func (s *Service) authenticated(event string, next func(http.ResponseWriter, *http.Request, store.Device)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if ok, wait := s.limits.allow(clientKey(r.RemoteAddr), s.now()); !ok {
-			s.rateLimited(w, r, event, wait)
-			return
-		}
 		var chains [][]*x509.Certificate
 		if r.TLS != nil {
 			chains = r.TLS.VerifiedChains
 		}
 		dev, serial, err := s.Authenticate(r.Context(), chains)
 		if err != nil {
+			// Only work without a valid device credential is limited per
+			// client address, so a shared address can't lock out a phone
+			// that has one.
+			if ok, wait := s.limits.allow(clientKey(r.RemoteAddr), s.now()); !ok {
+				s.rateLimited(w, r, event, wait)
+				return
+			}
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
+			return
+		}
+		if ok, wait := s.devices.allow(dev.ID, s.now()); !ok {
+			s.rateLimited(w, r, event, wait)
+			return
+		}
+		if !s.checkUser(w, r, event, dev) {
 			return
 		}
 		// The phone uses a renewed credential only once it has it, so
@@ -221,6 +348,24 @@ func (s *Service) authenticated(event string, next func(http.ResponseWriter, *ht
 	}
 }
 
+// checkUser makes sure the device's user is still enabled; a disabled
+// user's phone must not get Wi-Fi settings or confirm certificates. It
+// answers the request itself and returns false on failure.
+func (s *Service) checkUser(w http.ResponseWriter, r *http.Request, event string, dev store.Device) bool {
+	_, err := s.bao.EnabledUser(r.Context(), dev.Username)
+	switch {
+	case errors.Is(err, openbao.ErrUserNotEnabled):
+		s.refuse(w, r, event, fail(403, "user_disabled", "user is not enabled", nil),
+			"device", dev.ID, "username", dev.Username)
+		return false
+	case err != nil:
+		s.refuse(w, r, event, fail(502, "openbao_error", "certificate authority unavailable", err),
+			"device", dev.ID, "username", dev.Username)
+		return false
+	}
+	return true
+}
+
 func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
 	return s.authenticated(event, func(w http.ResponseWriter, r *http.Request, dev store.Device) {
 		csr, err := readCSR(w, r, p)
@@ -228,12 +373,28 @@ func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
 			return
 		}
+		var attResult attest.Result
+		if s.attestation != nil && p.kind == store.KindDevice {
+			// The challenge is fixed when the new key is generated, so
+			// it can only name the credential presented now.
+			leaf := r.TLS.VerifiedChains[0][0]
+			challenge := sha256.Sum256(leaf.Raw)
+			attResult, err = s.verifyAttestation(r, csr.PublicKey, challenge[:])
+			if err != nil {
+				s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
+				return
+			}
+		}
 		certs, err := s.sign(r.Context(), p, dev, csr)
 		if err != nil {
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
 			return
 		}
-		s.log.Info(event, "remote", r.RemoteAddr, "device", dev.ID, "username", dev.Username, "label", dev.Label)
+		attrs := []any{"remote", r.RemoteAddr, "device", dev.ID, "username", dev.Username, "label", dev.Label}
+		if s.attestation != nil && p.kind == store.KindDevice {
+			attrs = append(attrs, attestationLogAttrs(attResult)...)
+		}
+		s.log.Info(event, attrs...)
 		s.respond(w, certs)
 	})
 }

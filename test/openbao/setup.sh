@@ -78,7 +78,8 @@ text = open(sys.argv[1]).read()
 print(re.search(r"```hcl\n(.*?)```", text, re.S).group(1))
 EOF
 bao policy write eap-enroll pki/policy.hcl >/dev/null
-bao write auth/approle/role/eap-enroll token_policies=eap-enroll token_ttl=20m token_max_ttl=1h \
+bao write auth/approle/role/eap-enroll token_policies=eap-enroll token_no_default_policy=true \
+  token_ttl=20m token_max_ttl=1h secret_id_ttl=2160h \
   secret_id_bound_cidrs=127.0.0.1/32 token_bound_cidrs=127.0.0.1/32 >/dev/null
 bao read -field=role_id auth/approle/role/eap-enroll/role-id >state/role-id
 bao write -f -field=secret_id auth/approle/role/eap-enroll/secret-id >state/secret-id

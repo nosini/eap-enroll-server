@@ -11,6 +11,11 @@
   "code_ttl": "15m",
   "wifi_ttl": "1440h",
   "device_ttl": "8760h",
+  "key_attestation": {
+    "roots_file": "/etc/eap-enroll/attestation-roots.pem",
+    "status_url": "https://android.googleapis.com/attestation/status",
+    "require_strongbox": false
+  },
   "wifi_profile": {
     "ssid": "Example Net",
     "server_domain": "radius.example.org",

@@ -80,18 +80,20 @@ func New(cfg config.OpenBao) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.TLSServerName}
-	if cfg.CAFile != "" {
-		certs, err := config.ReadCertificates(cfg.CAFile)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		for _, c := range certs {
-			pool.AddCert(c)
-		}
-		tlsConfig.RootCAs = pool
+	// Only the configured CA is trusted, never the system roots: every
+	// login sends the secret ID to this server.
+	if cfg.CAFile == "" {
+		return nil, errors.New("openbao: ca_file is required")
 	}
+	certs, err := config.ReadCertificates(cfg.CAFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	for _, c := range certs {
+		pool.AddCert(c)
+	}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: cfg.TLSServerName, RootCAs: pool}
 	transport := &http.Transport{
 		TLSClientConfig:     tlsConfig,
 		TLSHandshakeTimeout: 10 * time.Second,
@@ -180,14 +182,53 @@ func (c *Client) raw(ctx context.Context, method, path, token string, body, out 
 }
 
 // currentToken returns a valid token, logging in when there is none or it
-// is about to expire. force discards the cached token.
-func (c *Client) currentToken(ctx context.Context, force bool) (string, error) {
+// is about to expire. failed is a token OpenBao refused: it is replaced
+// unless another request has replaced it already. A replaced token is
+// revoked, so it doesn't stay usable until its TTL ends.
+func (c *Client) currentToken(ctx context.Context, failed string) (string, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !force && c.token != "" && time.Now().Before(c.expires) {
-		return c.token, nil
+	token, old, err := c.loginLocked(ctx, failed)
+	c.mu.Unlock()
+	if old != "" {
+		// Best effort: the old token may be invalid already (that's why a
+		// request failed), and it expires anyway.
+		c.revokeToken(context.WithoutCancel(ctx), old)
 	}
+	return token, err
+}
+
+// loginLocked is currentToken's part under c.mu. It also returns the token
+// it replaced, if any.
+func (c *Client) loginLocked(ctx context.Context, failed string) (token, old string, err error) {
+	if c.token != "" && c.token != failed && time.Now().Before(c.expires) {
+		return c.token, "", nil
+	}
+	old, c.token = c.token, ""
+	token, err = c.login(ctx)
+	return token, old, err
+}
+
+// revokeToken revokes a token with its own revoke-self call; errors are
+// ignored.
+func (c *Client) revokeToken(ctx context.Context, token string) {
+	c.raw(ctx, http.MethodPost, "auth/token/revoke-self", token, nil, nil)
+}
+
+// Close revokes the current token. The client logs in again if it is used
+// afterwards.
+func (c *Client) Close(ctx context.Context) error {
+	c.mu.Lock()
+	token := c.token
 	c.token = ""
+	c.mu.Unlock()
+	if token == "" {
+		return nil
+	}
+	return c.raw(ctx, http.MethodPost, "auth/token/revoke-self", token, nil, nil)
+}
+
+// login logs in with the AppRole and caches the token; c.mu must be held.
+func (c *Client) login(ctx context.Context) (string, error) {
 	roleID, err := readSecretFile(c.cfg.RoleIDFile)
 	if err != nil {
 		return "", fmt.Errorf("role ID: %w", err)
@@ -225,14 +266,14 @@ func (c *Client) currentToken(ctx context.Context, force bool) (string, error) {
 // call sends an authenticated request; on 403 it logs in again once and
 // retries, since an expired or revoked token also answers 403.
 func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
-	token, err := c.currentToken(ctx, false)
+	token, err := c.currentToken(ctx, "")
 	if err != nil {
 		return err
 	}
 	err = c.raw(ctx, method, path, token, body, out)
 	var e *Error
 	if errors.As(err, &e) && e.Status == http.StatusForbidden {
-		if token, err = c.currentToken(ctx, true); err != nil {
+		if token, err = c.currentToken(ctx, token); err != nil {
 			return err
 		}
 		err = c.raw(ctx, method, path, token, body, out)

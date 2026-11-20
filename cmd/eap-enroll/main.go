@@ -64,7 +64,19 @@ func main() {
 type app struct {
 	cfg   *config.Config
 	store *store.Store
+	bao   *openbao.Client
 	svc   *enroll.Service
+}
+
+// close revokes the OpenBao token, so it isn't left valid until its TTL
+// ends, and closes the database.
+func (a *app) close() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := a.bao.Close(ctx); err != nil {
+		slog.Error("token_revoke_failed", "error", err.Error())
+	}
+	a.store.Close()
 }
 
 // open parses the flags common to all commands plus extra ones, then
@@ -103,7 +115,7 @@ func open(name string, args []string, minArgs, maxArgs int, extra func(*flag.Fla
 		st.Close()
 		return nil, nil, err
 	}
-	return &app{cfg: cfg, store: st, svc: svc}, fs.Args(), nil
+	return &app{cfg: cfg, store: st, bao: bao, svc: svc}, fs.Args(), nil
 }
 
 func serve(args []string) error {
@@ -111,7 +123,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer a.store.Close()
+	defer a.close()
 	srv, err := a.svc.Server()
 	if err != nil {
 		return err
@@ -120,6 +132,7 @@ func serve(args []string) error {
 	defer stop()
 
 	a.svc.CleanupCodes(ctx)
+	go a.svc.RunAttestationStatus(ctx)
 	go func() {
 		t := time.NewTicker(time.Hour)
 		defer t.Stop()
@@ -161,7 +174,7 @@ func code(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer a.store.Close()
+	defer a.close()
 	if user == "" || label == "" {
 		return errors.New("-user and -label are required")
 	}
@@ -179,7 +192,7 @@ func devices(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer a.store.Close()
+	defer a.close()
 	list, err := a.store.Devices(context.Background())
 	if err != nil {
 		return err
@@ -212,7 +225,7 @@ func disable(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer a.store.Close()
+	defer a.close()
 	remaining, err := a.svc.DisableDevice(context.Background(), rest[0])
 	if errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("no device %s", rest[0])

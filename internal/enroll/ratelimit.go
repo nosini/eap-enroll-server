@@ -18,22 +18,33 @@ const (
 	postRate  = 10.0 / 60 // tokens per second
 	postBurst = 5
 
+	// Authenticated requests: a token bucket per device, with the same
+	// rate but a larger burst, since setting up a phone takes several
+	// requests in a row (profile, Wi-Fi certificate, confirmation,
+	// retries). What a device can be issued is capped separately.
+	deviceBurst = 10
+
 	// Wrong, used or expired codes: a client with codeFailLimit failures
 	// within codeFailWindow is blocked for codeBlock.
 	codeFailLimit  = 5
 	codeFailWindow = 15 * time.Minute
 	codeBlock      = 15 * time.Minute
 
-	// Wrong codes from all clients together: above globalFailLimit in a
-	// globalFailWindow, code enrollment is refused for everyone until the
-	// window ends.
+	// Wrong codes from all clients together: globalFailLimit within
+	// globalFailWindow only logs one warning; it never refuses anything,
+	// because a usable code is an unguessable secret.
 	globalFailLimit  = 30
 	globalFailWindow = 15 * time.Minute
 
-	// Entries idle this long are dropped; the maps never hold more than
-	// maxClients entries (new clients are refused while full).
+	// Entries idle this long are dropped. The map holds at most
+	// maxClients entries; when it is full, entries are evicted, never
+	// refused.
 	idleExpiry = 30 * time.Minute
 	maxClients = 65536
+
+	// evictScan bounds how many entries a full map is scanned for an
+	// unblocked one to evict.
+	evictScan = 256
 )
 
 type clientState struct {
@@ -45,15 +56,18 @@ type clientState struct {
 }
 
 type limiter struct {
-	mu          sync.Mutex
-	clients     map[string]*clientState
-	lastSweep   time.Time
-	globalFails int
-	globalStart time.Time
+	mu           sync.Mutex
+	clients      map[string]*clientState
+	max          int     // maxClients, lower in tests
+	burst        float64 // bucket size
+	lastSweep    time.Time
+	globalFails  int
+	globalStart  time.Time
+	globalWarned bool
 }
 
-func newLimiter() *limiter {
-	return &limiter{clients: make(map[string]*clientState)}
+func newLimiter(burst float64) *limiter {
+	return &limiter{clients: make(map[string]*clientState), max: maxClients, burst: burst}
 }
 
 // clientKey groups IPv6 clients by /64, since one host usually has a
@@ -75,21 +89,57 @@ func clientKey(remoteAddr string) string {
 	return addr.String()
 }
 
-func (l *limiter) state(key string, now time.Time) *clientState {
-	if now.Sub(l.lastSweep) > time.Minute {
-		for k, s := range l.clients {
-			if now.Sub(s.last) > idleExpiry && now.After(s.blockedUntil) {
-				delete(l.clients, k)
-			}
+// sweep drops entries that have been idle and aren't blocked.
+func (l *limiter) sweep(now time.Time) {
+	for k, s := range l.clients {
+		if now.Sub(s.last) > idleExpiry && now.After(s.blockedUntil) {
+			delete(l.clients, k)
 		}
-		l.lastSweep = now
+	}
+	l.lastSweep = now
+}
+
+// evict makes room for a new key in a full map. It prefers an entry that
+// isn't blocked, scanning at most evictScan entries in map order; if all
+// of those are blocked, it evicts the first one seen.
+func (l *limiter) evict(now time.Time) {
+	var first, unblocked string
+	scanned := 0
+	for k, s := range l.clients {
+		if scanned == 0 {
+			first = k
+		}
+		scanned++
+		if !now.Before(s.blockedUntil) {
+			unblocked = k
+			break
+		}
+		if scanned >= evictScan {
+			break
+		}
+	}
+	if unblocked != "" {
+		delete(l.clients, unblocked)
+	} else if first != "" {
+		delete(l.clients, first)
+	}
+}
+
+// state returns the client's entry, creating it if needed. It never
+// returns nil: in a full map, an entry is evicted to make room.
+func (l *limiter) state(key string, now time.Time) *clientState {
+	// Sweeping is a full scan, so at most once a minute: sweeping on every
+	// new key of a full map would let new addresses buy CPU time under
+	// the lock.
+	if now.Sub(l.lastSweep) > time.Minute {
+		l.sweep(now)
 	}
 	s := l.clients[key]
 	if s == nil {
-		if len(l.clients) >= maxClients {
-			return nil
+		if len(l.clients) >= l.max {
+			l.evict(now)
 		}
-		s = &clientState{tokens: postBurst, last: now}
+		s = &clientState{tokens: l.burst, last: now}
 		l.clients[key] = s
 	}
 	return s
@@ -101,10 +151,7 @@ func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	s := l.state(key, now)
-	if s == nil {
-		return false, time.Minute
-	}
-	s.tokens = min(postBurst, s.tokens+now.Sub(s.last).Seconds()*postRate)
+	s.tokens = min(l.burst, s.tokens+now.Sub(s.last).Seconds()*postRate)
 	s.last = now
 	if s.tokens < 1 {
 		return false, time.Duration((1-s.tokens)/postRate*float64(time.Second)) + time.Second
@@ -117,31 +164,28 @@ func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
 func (l *limiter) codeAllowed(key string, now time.Time) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.globalFails >= globalFailLimit && now.Sub(l.globalStart) < globalFailWindow {
-		return false, globalFailWindow - now.Sub(l.globalStart)
-	}
 	s := l.state(key, now)
-	if s == nil {
-		return false, time.Minute
-	}
 	if now.Before(s.blockedUntil) {
 		return false, s.blockedUntil.Sub(now)
 	}
 	return true, 0
 }
 
-// codeFailed records a wrong, used or expired code.
-func (l *limiter) codeFailed(key string, now time.Time) {
+// codeFailed records a wrong, used or expired code. It returns true when
+// the global failure count has just reached globalFailLimit in this
+// window, so the caller logs one warning; it never refuses anything.
+func (l *limiter) codeFailed(key string, now time.Time) (warn bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if now.Sub(l.globalStart) >= globalFailWindow {
-		l.globalStart, l.globalFails = now, 0
+		l.globalStart, l.globalFails, l.globalWarned = now, 0, false
 	}
 	l.globalFails++
-	s := l.state(key, now)
-	if s == nil {
-		return
+	if l.globalFails >= globalFailLimit && !l.globalWarned {
+		l.globalWarned = true
+		warn = true
 	}
+	s := l.state(key, now)
 	if now.Sub(s.failStart) >= codeFailWindow {
 		s.failStart, s.fails = now, 0
 	}
@@ -150,4 +194,5 @@ func (l *limiter) codeFailed(key string, now time.Time) {
 		s.blockedUntil = now.Add(codeBlock)
 		s.fails = 0
 	}
+	return warn
 }

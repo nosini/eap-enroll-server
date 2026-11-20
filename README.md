@@ -40,7 +40,8 @@ fields are errors.
 | `code_ttl` | Lifetime of one-time codes (default 15m, at most 24h). |
 | `wifi_ttl`, `device_ttl` | Certificate lifetimes, sent to OpenBao verbatim as `ttl`. |
 | `wifi_profile` | Optional: `ssid`, `server_domain` (RADIUS server certificate name) and `server_ca_file` (CA of the RADIUS server certificate), served at `wifi/profile`. |
-| `openbao.*` | Address, optional CA file and TLS server name, AppRole role ID and secret ID files, and the mounts, roles and KV path (defaults as in the example). |
+| `key_attestation` | Optional: require Android hardware key attestation for device credentials. `roots_file` (PEM, required; [deploy/attestation-roots.pem](deploy/attestation-roots.pem) holds Google's current roots), `status_url` (optional public revocation list), `require_strongbox`, `verified_boot_keys` (hex), and `app_package` with `app_signing_certs` (hex SHA-256). Wi-Fi certificates are unaffected. |
+| `openbao.*` | Address, CA file (required: the only CA trusted for OpenBao), optional TLS server name, AppRole role ID and secret ID files, and the mounts, roles and KV path (defaults as in the example). |
 
 [deploy/eap-enroll.service](deploy/eap-enroll.service) is an example
 systemd unit.
@@ -60,6 +61,11 @@ eap-enroll devices -config FILE
 # OpenBao failure):
 eap-enroll disable -config FILE DEVICE_ID
 ```
+
+When a phone is set up again with a new code, disable its old device.
+The service disables a device by itself when a superseded device
+credential is used again (`credential_reuse` in the log); the phone then
+needs a new code.
 
 ## Licence
 

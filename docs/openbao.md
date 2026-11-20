@@ -107,21 +107,47 @@ path "pki-radius/crl/rotate" { capabilities = ["read"] }
 path "pki-enroll/crl/rotate" { capabilities = ["read"] }
 
 path "kv/data/apps/freeradius/user-groups" { capabilities = ["read"] }
+
+path "auth/token/revoke-self" { capabilities = ["update"] }
 ```
 
 Limits of this policy: the service can revoke any certificate in both
 mounts, not just those it issued, and the `eap-client` role decides which
 usernames are valid at all; the service's own user check comes on top.
 
-The AppRole: short token TTL, secret ID bound to the service host's
-address.
+The AppRole: short token TTL, no default policy (the policy above lists
+the one path from it that the service uses, `revoke-self`), secret ID
+bound to the service host's address and with a lifetime.
 
 ```sh
 bao write auth/approle/role/eap-enroll \
-  token_policies=eap-enroll token_ttl=20m token_max_ttl=1h \
+  token_policies=eap-enroll token_no_default_policy=true \
+  token_ttl=20m token_max_ttl=1h \
   secret_id_bound_cidrs=<service address>/32 token_bound_cidrs=<service address>/32 \
-  secret_id_ttl=0 secret_id_num_uses=0
+  secret_id_ttl=2160h secret_id_num_uses=0
 ```
 
-The service logs in again whenever its token is about to expire, so the
-token needn't be renewable.
+The service logs in again whenever its token is about to expire or
+OpenBao refuses it, so the token needn't be renewable. It revokes the
+token it replaces and, when it or an admin command exits, its current
+token, so a leaked token stays usable only as long as the process still
+uses it.
+
+The service reads the secret ID file at every login, so replacing the
+secret ID needs no restart: before `secret_id_ttl` runs out, write a new
+secret ID to the file (from the deployment), then destroy the old one by
+its accessor (`auth/approle/role/eap-enroll/secret-id-accessor/destroy`).
+Logins need `secret_id_num_uses=0`, because the service logs in every
+~16 minutes.
+
+Whoever can read the secret ID file can log in from the service host and
+do everything the policy allows, including signing a Wi-Fi certificate
+for any username the `eap-client` role accepts. The admin commands need
+it as well, so everyone who may run them (`sudo -u eap-enroll`) holds
+that power; give that only to people who could issue Wi-Fi certificates
+anyway.
+
+`openbao.ca_file` is required and is the only trust anchor for OpenBao's
+TLS certificate (the system's CAs aren't used), since every login sends
+the secret ID. Use the CA that issues OpenBao's server certificate, ideally
+a private one.

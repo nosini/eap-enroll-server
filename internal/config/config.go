@@ -67,6 +67,17 @@ type WifiProfile struct {
 	ServerCAFile string `json:"server_ca_file"`
 }
 
+// KeyAttestation configures optional Android hardware key attestation
+// for device credential keys.
+type KeyAttestation struct {
+	RootsFile        string   `json:"roots_file"`
+	StatusURL        string   `json:"status_url"`
+	RequireStrongBox bool     `json:"require_strongbox"`
+	VerifiedBootKeys []string `json:"verified_boot_keys"`
+	AppPackage       string   `json:"app_package"`
+	AppSigningCerts  []string `json:"app_signing_certs"`
+}
+
 // Config is the whole configuration file.
 type Config struct {
 	Listen            string   `json:"listen"`
@@ -84,6 +95,9 @@ type Config struct {
 	OpenBao           OpenBao  `json:"openbao"`
 	// WifiProfile is optional; without it wifi/profile answers 404.
 	WifiProfile *WifiProfile `json:"wifi_profile"`
+	// KeyAttestation is optional; without it device credentials don't
+	// need hardware key attestation.
+	KeyAttestation *KeyAttestation `json:"key_attestation"`
 }
 
 // hostname matches a DNS name (letters, digits, hyphens, dots).
@@ -178,7 +192,9 @@ func (c *Config) validate() error {
 	if u, err := url.Parse(o.Address); err != nil || u.Scheme != "https" || u.Host == "" {
 		errs = append(errs, errors.New("openbao.address must be an https URL"))
 	}
-	file("openbao.ca_file", o.CAFile, true)
+	// Required: the AppRole secret ID goes to this server at every login,
+	// so it must not be any server with a publicly trusted certificate.
+	file("openbao.ca_file", o.CAFile, false)
 	file("openbao.role_id_file", o.RoleIDFile, false)
 	file("openbao.secret_id_file", o.SecretIDFile, false)
 	for name, v := range map[string]string{
@@ -198,6 +214,36 @@ func (c *Config) validate() error {
 			errs = append(errs, errors.New("wifi_profile.server_domain must be a DNS name"))
 		}
 		file("wifi_profile.server_ca_file", p.ServerCAFile, false)
+	}
+	if a := c.KeyAttestation; a != nil {
+		file("key_attestation.roots_file", a.RootsFile, false)
+		if a.StatusURL != "" {
+			if u, err := url.Parse(a.StatusURL); err != nil || u.Scheme != "https" ||
+				u.Host == "" || u.User != nil || u.Fragment != "" {
+				errs = append(errs, errors.New("key_attestation.status_url must be an https URL"))
+			}
+		}
+		for i, k := range a.VerifiedBootKeys {
+			if k == "" {
+				errs = append(errs, fmt.Errorf("key_attestation.verified_boot_keys[%d] is empty", i))
+				continue
+			}
+			if _, err := hex.DecodeString(k); err != nil {
+				errs = append(errs, fmt.Errorf("key_attestation.verified_boot_keys[%d] is not hex: %w", i, err))
+			}
+		}
+		if a.AppPackage == "" && len(a.AppSigningCerts) != 0 {
+			errs = append(errs, errors.New("key_attestation.app_package is required with app_signing_certs"))
+		}
+		if a.AppPackage != "" && len(a.AppSigningCerts) == 0 {
+			errs = append(errs, errors.New("key_attestation.app_signing_certs is required with app_package"))
+		}
+		for i, s := range a.AppSigningCerts {
+			b, err := hex.DecodeString(s)
+			if err != nil || len(b) != sha256.Size {
+				errs = append(errs, fmt.Errorf("key_attestation.app_signing_certs[%d] must be a hex SHA-256 (32 bytes)", i))
+			}
+		}
 	}
 	if o.WifiMount == o.DeviceMount {
 		errs = append(errs, errors.New("openbao.wifi_mount and device_mount must differ"))

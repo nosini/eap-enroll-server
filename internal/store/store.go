@@ -21,11 +21,12 @@ import (
 
 // Errors the callers distinguish.
 var (
-	ErrNotFound       = errors.New("not found")
-	ErrCodeInvalid    = errors.New("unknown code")
-	ErrCodeUsed       = errors.New("code already used")
-	ErrCodeExpired    = errors.New("code expired")
-	ErrDeviceDisabled = errors.New("device is disabled")
+	ErrNotFound            = errors.New("not found")
+	ErrCodeInvalid         = errors.New("unknown code")
+	ErrCodeUsed            = errors.New("code already used")
+	ErrCodeExpired         = errors.New("code expired")
+	ErrDeviceDisabled      = errors.New("device is disabled")
+	ErrTooManyCertificates = errors.New("too many certificates for this device")
 )
 
 // Certificate kinds.
@@ -33,6 +34,25 @@ const (
 	KindDevice = "device"
 	KindWifi   = "wifi"
 )
+
+// Per-device limits on the certificates of each kind: at most this many
+// are valid (unrevoked, unexpired) at once, and at most this many are
+// issued within issuanceWindow, counting revoked ones.
+const (
+	maxValidWifi    = 5
+	maxValidDevice  = 3
+	maxIssuedWifi   = 10
+	maxIssuedDevice = 5
+	issuanceWindow  = 24 * time.Hour
+)
+
+// limits returns the per-device caps for a certificate kind.
+func limits(kind string) (valid, issued int) {
+	if kind == KindDevice {
+		return maxValidDevice, maxIssuedDevice
+	}
+	return maxValidWifi, maxIssuedWifi
+}
 
 // schemaVersion is stored in PRAGMA user_version.
 const schemaVersion = 1
@@ -166,6 +186,41 @@ func (s *Store) CreateCode(ctx context.Context, hash []byte, username, label str
 	return err
 }
 
+// queryer is a database or transaction, which is all readCode needs.
+type queryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// readCode reads a code and reports whether it can be used at now: nil,
+// ErrCodeInvalid, ErrCodeUsed or ErrCodeExpired. UseCode and CheckCode
+// share it so both answer the same.
+func readCode(ctx context.Context, q queryer, hash []byte, now time.Time) (username, label string, err error) {
+	var (
+		expires int64
+		used    sql.NullInt64
+	)
+	err = q.QueryRowContext(ctx, `SELECT username, label, expires, used FROM codes WHERE hash = ?`, hash).
+		Scan(&username, &label, &expires, &used)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", "", ErrCodeInvalid
+	case err != nil:
+		return "", "", err
+	case used.Valid:
+		return "", "", ErrCodeUsed
+	case unix(now) >= expires:
+		return "", "", ErrCodeExpired
+	}
+	return username, label, nil
+}
+
+// CheckCode reports whether a code can be used, without changing
+// anything: nil, ErrCodeInvalid, ErrCodeUsed or ErrCodeExpired.
+func (s *Store) CheckCode(ctx context.Context, hash []byte, now time.Time) error {
+	_, _, err := readCode(ctx, s.db, hash, now)
+	return err
+}
+
 // UseCode consumes a code and creates a device with deviceID for the
 // code's username and label, in one transaction.
 func (s *Store) UseCode(ctx context.Context, hash []byte, deviceID string, now time.Time) (Device, error) {
@@ -174,22 +229,9 @@ func (s *Store) UseCode(ctx context.Context, hash []byte, deviceID string, now t
 		return Device{}, err
 	}
 	defer tx.Rollback()
-	var (
-		username, label string
-		expires         int64
-		used            sql.NullInt64
-	)
-	err = tx.QueryRowContext(ctx, `SELECT username, label, expires, used FROM codes WHERE hash = ?`, hash).
-		Scan(&username, &label, &expires, &used)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return Device{}, ErrCodeInvalid
-	case err != nil:
+	username, label, err := readCode(ctx, tx, hash, now)
+	if err != nil {
 		return Device{}, err
-	case used.Valid:
-		return Device{}, ErrCodeUsed
-	case unix(now) >= expires:
-		return Device{}, ErrCodeExpired
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE codes SET used = ? WHERE hash = ?`, unix(now), hash); err != nil {
 		return Device{}, err
@@ -232,10 +274,13 @@ func (s *Store) Device(ctx context.Context, id string) (Device, error) {
 }
 
 // AddCertificate records an issued certificate. It fails with
-// ErrDeviceDisabled if the device was disabled meanwhile; the caller must
-// then revoke the certificate. Because SQLite serialises writers, either
-// this insert happens before the device is disabled (and disabling sees
-// and revokes the certificate) or it fails.
+// ErrDeviceDisabled if the device was disabled meanwhile and with
+// ErrTooManyCertificates if the device already holds the maximum number
+// of valid certificates of that kind; the caller must then revoke the
+// certificate. Because SQLite serialises writers, either this insert
+// happens before the device is disabled (and disabling sees and revokes
+// the certificate) or it fails, and concurrent requests can't exceed the
+// cap.
 func (s *Store) AddCertificate(ctx context.Context, c Certificate) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -253,12 +298,44 @@ func (s *Store) AddCertificate(ctx context.Context, c Certificate) error {
 	if disabled.Valid {
 		return ErrDeviceDisabled
 	}
+	var valid int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM certificates
+		 WHERE device_id = ? AND kind = ? AND revoked IS NULL AND not_after > ?`,
+		c.DeviceID, c.Kind, unix(c.Issued)).Scan(&valid); err != nil {
+		return err
+	}
+	if maxValid, _ := limits(c.Kind); valid >= maxValid {
+		return ErrTooManyCertificates
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO certificates (serial, kind, device_id, issued, not_after) VALUES (?, ?, ?, ?, ?)`,
 		c.Serial, c.Kind, c.DeviceID, unix(c.Issued), unix(c.NotAfter)); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// CheckCertificateLimit reports whether the device may get another
+// certificate of kind at now: ErrTooManyCertificates if it already has
+// the maximum number of valid ones or was issued the maximum number
+// within issuanceWindow.
+func (s *Store) CheckCertificateLimit(ctx context.Context, deviceID, kind string, now time.Time) error {
+	var valid, issued int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+		  coalesce(sum(CASE WHEN revoked IS NULL AND not_after > ? THEN 1 ELSE 0 END), 0),
+		  coalesce(sum(CASE WHEN issued > ? THEN 1 ELSE 0 END), 0)
+		FROM certificates WHERE device_id = ? AND kind = ?`,
+		unix(now), unix(now.Add(-issuanceWindow)), deviceID, kind).Scan(&valid, &issued)
+	if err != nil {
+		return err
+	}
+	maxValid, maxIssued := limits(kind)
+	if valid >= maxValid || issued >= maxIssued {
+		return ErrTooManyCertificates
+	}
+	return nil
 }
 
 // Certificate returns a certificate by kind and serial.

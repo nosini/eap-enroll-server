@@ -1,7 +1,8 @@
 # Example unit. Create the user first:
 #   useradd --system --home-dir /var/lib/eap-enroll --shell /usr/sbin/nologin eap-enroll
 # Files in /etc/eap-enroll: root:eap-enroll, 0640 (role-id, secret-id and
-# the TLS key included). Admin commands run as the same user:
+# the TLS key included). Admin commands run as the same user, so whoever
+# may run them can use the AppRole (see docs/openbao.md):
 #   sudo -u eap-enroll eap-enroll code -config /etc/eap-enroll/config.json -user USER -label LABEL
 [Unit]
 Description=EAP-TLS enrollment server

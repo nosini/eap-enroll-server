@@ -76,16 +76,80 @@ credential instead.
 
 | Status | Meaning | Client action |
 | --- | --- | --- |
-| 400 | Malformed body, bad CSR or wrong key type | Fix the request; don't retry as is |
-| 401 | Missing, wrong, used or expired code; missing, unknown, revoked or expired device credential | Setup needs a new code |
-| 403 | Device or user disabled | Stop; tell the user |
+| 400 | Malformed body, bad CSR, wrong key type, or missing/malformed key attestation when required (`bad_attestation`) | Fix the request; don't retry as is |
+| 401 | Missing, wrong, used or expired code; missing, unknown or expired device credential | Setup needs a new code |
+| 403 | Device or user disabled, a superseded device credential was reused, or key attestation was refused (`attestation_refused`) | Stop; tell the user |
 | 413 | Body too large | Don't retry |
-| 429 | Rate limited; `Retry-After` in seconds | Wait at least that long |
-| 502 | The certificate authority failed | Retry later |
+| 429 | Rate limited or too many certificates for this device; `Retry-After` in seconds | Wait at least that long |
+| 502 | The certificate authority failed, or the key attestation status list is unavailable (`attestation_status_unavailable`) | Retry later |
 | 500 | Other server error | Retry later |
 
-A failed CSR check (400) doesn't use up a one-time code; any other
+A missing, wrong, used or expired code is answered with 401 before the
+CSR is read; a bad CSR (400) doesn't use up a one-time code, any other
 answer to `device/simpleenroll` does.
+
+Every endpoint that needs the device credential also checks that the
+device's user is still enabled; a disabled user gets 403 on all of them.
+
+### Key attestation
+
+The service can require Android hardware key attestation for the key in
+a device credential, so the key is proven to have been generated in the
+phone's TEE or StrongBox. The setup URI doesn't say whether this is
+required. If it is, a `device/simpleenroll` or `device/simplereenroll`
+without a usable attestation gets `400` with `bad_attestation`; the app
+should then generate its key with an attestation challenge and retry
+with the same code or credential. The service verifies the chain
+offline. This is not Play Integrity and needs no Google API (except the
+optional public revocation list); it works on stock Android and on
+GrapheneOS, which reports `SelfSigned` verified boot with its own
+verified-boot key.
+
+On Android, the app generates the device key with the challenge and then
+reads the certificate chain:
+
+```java
+KeyGenParameterSpec spec = new KeyGenParameterSpec.Builder(alias,
+        KeyProperties.PURPOSE_SIGN)
+    .setAttestationChallenge(challenge)
+    // Optional. The server may require StrongBox; without that, fall
+    // back to TEE if StrongBox is unavailable.
+    .setIsStrongBoxBacked(true)
+    .build();
+// KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+//     .initialize(spec).generateKeyPair();
+
+Certificate[] chain =
+    keyStore.getCertificateChain(alias); // leaf first, then its issuers
+```
+
+The `Key-Attestation` request header is standard base64, without line
+breaks, of the concatenated DER certificates of that chain (each
+`getEncoded()`, leaf first). It must be the chain for the CSR's key. The
+header is needed only when the service requires attestation; otherwise
+it is ignored.
+
+The challenge is different per endpoint:
+
+- `device/simpleenroll`: SHA-256 of the one-time code exactly as sent in
+  `Authorization: Bearer`.
+- `device/simplereenroll`: SHA-256 of the DER encoding of the device
+  credential presented in TLS (the leaf certificate, not the code).
+
+Android fixes the challenge when the key is generated. A renewal with
+attestation therefore needs a **new key**, generated with the hash of the
+credential that is currently in use. The existing key cannot be
+re-attested; using it, or using the old challenge, gets
+`403 attestation_refused`. Generate the new key before sending the
+renewal, keep using the old credential until the new one is stored, and
+then switch to it as described under
+[Device credential renewal](#device-credential-renewal).
+
+If the service uses the public attestation revocation list, it refuses
+attestation with `502 attestation_status_unavailable` while it has no
+successfully fetched list, or when the last successful fetch is more
+than seven days old. Retrying later is safe; a refused attestation does
+not use up the one-time code.
 
 ### `wifi/confirm`
 
@@ -139,6 +203,15 @@ until the phone first authenticates with the new one; then the service
 revokes the older credentials of that device. So the phone must switch to
 the new credential right after renewing and keep the old one until it
 has.
+
+Once the phone has stored the renewed credential it must never use the
+old one again, and it must not send requests with the old credential
+concurrently with the renewal. Using a superseded credential is treated
+as a copied credential: the service disables the device, revokes its
+certificates and answers 403. The device then needs a new code.
+
+When a phone is set up again, disable its old device with
+`eap-enroll disable` instead of leaving it to expire.
 
 ## Lifetimes
 
