@@ -245,6 +245,37 @@ func TestCodeFailures(t *testing.T) {
 	}
 }
 
+// Every refusal names its reason in an Enroll-Error response header;
+// the client uses it to tell refusals apart that share a status.
+func TestEnrollErrorHeader(t *testing.T) {
+	e := newEnv(t)
+	key := newKey(t, elliptic.P256())
+	c := e.client(nil)
+
+	if r := e.post(c, "device/simpleenroll", "", csrBody(t, key, "x")); r.status != 401 ||
+		r.header.Get("Enroll-Error") != "no_code" {
+		t.Errorf("no code: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	if r := e.post(c, "device/simpleenroll", "WRONGCODE", csrBody(t, key, "x")); r.status != 401 ||
+		r.header.Get("Enroll-Error") != "bad_code" {
+		t.Errorf("wrong code: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	code := e.code("alice", "Phone")
+	e.now = e.now.Add(16 * time.Minute)
+	if r := e.post(c, "device/simpleenroll", code, csrBody(t, key, "x")); r.status != 401 ||
+		r.header.Get("Enroll-Error") != "code_expired" {
+		t.Errorf("expired code: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	bad := csrBody(t, key, "x")
+	der, _ := base64.StdEncoding.DecodeString(string(bad))
+	der[len(der)-3] ^= 0xff // inside the signature
+	code = e.code("alice", "Phone")
+	if r := e.post(c, "device/simpleenroll", code, []byte(base64.StdEncoding.EncodeToString(der))); r.status != 400 ||
+		r.header.Get("Enroll-Error") != "bad_csr" {
+		t.Errorf("bad CSR: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+}
+
 func TestCodeRateLimit(t *testing.T) {
 	e := newEnv(t)
 	body := csrBody(t, newKey(t, elliptic.P256()), "x")
@@ -259,6 +290,8 @@ func TestCodeRateLimit(t *testing.T) {
 	// The bucket is empty now.
 	if r := e.postDirect(remote, "device/simpleenroll", "WRONGCODE", body); r.status != 429 || r.header.Get("Retry-After") == "" {
 		t.Fatalf("empty bucket: %d", r.status)
+	} else if r.header.Get("Enroll-Error") != "rate_limited" {
+		t.Errorf("rate limited: Enroll-Error %q", r.header.Get("Enroll-Error"))
 	}
 	// A valid code bypasses the block and the empty bucket.
 	if r := e.postDirect(remote, "device/simpleenroll", e.code("alice", "Phone"), body); r.status != 200 {

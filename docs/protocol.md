@@ -72,7 +72,15 @@ credential instead.
   no content and no signers. Certificate order: the issued certificate
   first, then its CA chain (issuing CA first). `cacerts` has only the
   chain.
-- Errors have a short `text/plain` body meant for logs, not for parsing:
+- Errors have a short `text/plain` body meant for logs, not for parsing,
+  and an `Enroll-Error` response header naming the reason: the same
+  fixed code the service logs (`bad_code`, `user_disabled`,
+  `credential_reuse`, `attestation_refused`, `rate_limited`, ...; shown
+  in parentheses where it matters below). It tells refusals apart that
+  share a status: only `device_disabled` and `credential_reuse` mean a
+  disabled device; `user_disabled` clears up when the account is
+  enabled again, and `attestation_refused` at a renewal leaves the
+  current credential working.
 
 | Status | Meaning | Client action |
 | --- | --- | --- |

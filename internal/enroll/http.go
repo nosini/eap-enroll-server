@@ -120,6 +120,10 @@ func (s *Service) refuse(w http.ResponseWriter, r *http.Request, event string, e
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	// The reason is a fixed code the client can act on (the app tells a
+	// disabled account or a refused attestation from a disabled device,
+	// which all answer 403); the body is text meant for logs.
+	w.Header().Set("Enroll-Error", f.Reason)
 	w.WriteHeader(f.Status)
 	io.WriteString(w, f.Message+"\n")
 }

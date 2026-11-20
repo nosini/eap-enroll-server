@@ -197,9 +197,12 @@ func TestAttestationDoesNotConsumeCode(t *testing.T) {
 	// Missing header: 400, and the code is still usable.
 	code := e.code("alice", "Phone")
 	key := newKey(t, elliptic.P256())
-	if r := e.post(c, "device/simpleenroll", code, csrBody(t, key, "x")); r.status != 400 ||
-		!strings.Contains(r.body, "key attestation") {
+	r := e.post(c, "device/simpleenroll", code, csrBody(t, key, "x"))
+	if r.status != 400 || !strings.Contains(r.body, "key attestation") {
 		t.Fatalf("missing attestation: %d %s", r.status, r.body)
+	}
+	if re := r.header.Get("Enroll-Error"); re != "bad_attestation" {
+		t.Errorf("missing attestation: Enroll-Error %q, want bad_attestation", re)
 	}
 	challenge := sha256.Sum256([]byte(code))
 	if r := e.postAttested(c, "device/simpleenroll", code, csrBody(t, key, "x"),
@@ -211,10 +214,13 @@ func TestAttestationDoesNotConsumeCode(t *testing.T) {
 	code = e.code("alice", "Phone 2")
 	key = newKey(t, elliptic.P256())
 	wrong := sha256.Sum256([]byte("wrong challenge"))
-	if r := e.postAttested(c, "device/simpleenroll", code, csrBody(t, key, "x"),
-		attestationHeader(t, root, inter, key, wrong[:])); r.status != 403 ||
-		!strings.Contains(r.body, "key attestation refused") {
+	r = e.postAttested(c, "device/simpleenroll", code, csrBody(t, key, "x"),
+		attestationHeader(t, root, inter, key, wrong[:]))
+	if r.status != 403 || !strings.Contains(r.body, "key attestation refused") {
 		t.Fatalf("refused attestation: %d %s", r.status, r.body)
+	}
+	if re := r.header.Get("Enroll-Error"); re != "attestation_refused" {
+		t.Errorf("refused attestation: Enroll-Error %q, want attestation_refused", re)
 	}
 	challenge = sha256.Sum256([]byte(code))
 	if r := e.postAttested(c, "device/simpleenroll", code, csrBody(t, key, "x"),

@@ -188,14 +188,22 @@ func TestDisabledUserOnEveryEndpoint(t *testing.T) {
 
 	e.bao.groups["alice"] = "disabled"
 	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+estPrefix+"wifi/profile", nil)
-	if r := e.do(device, req); r.status != 403 || !strings.Contains(r.body, "user is not enabled") {
-		t.Errorf("profile: %d %s", r.status, r.body)
+	profile := e.do(device, req)
+	confirm := e.post(device, "wifi/confirm", "", []byte(serial))
+	enroll := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+	if profile.status != 403 || !strings.Contains(profile.body, "user is not enabled") {
+		t.Errorf("profile: %d %s", profile.status, profile.body)
 	}
-	if r := e.post(device, "wifi/confirm", "", []byte(serial)); r.status != 403 {
-		t.Errorf("confirm: %d %s", r.status, r.body)
+	if confirm.status != 403 {
+		t.Errorf("confirm: %d %s", confirm.status, confirm.body)
 	}
-	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 {
-		t.Errorf("simpleenroll: %d %s", r.status, r.body)
+	if enroll.status != 403 {
+		t.Errorf("simpleenroll: %d %s", enroll.status, enroll.body)
+	}
+	for _, r := range []result{profile, confirm, enroll} {
+		if re := r.header.Get("Enroll-Error"); re != "user_disabled" {
+			t.Errorf("%d: Enroll-Error %q, want user_disabled", r.status, re)
+		}
 	}
 	if !strings.Contains(e.logs.String(), `"reason":"user_disabled"`) {
 		t.Error("user_disabled not logged")

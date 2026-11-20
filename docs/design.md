@@ -244,7 +244,12 @@ JSON lines on standard error (the journal): `code_created`,
 `user_disabled`, `device_disabled`, `credential_reuse`, `unknown_cert`,
 `revoked_cert`, `rate_limited`, `too_many_certificates`, `bad_csr`,
 `bad_attestation`, `attestation_refused`,
-`attestation_status_unavailable`, `openbao_error`, ...). Fields: remote
+`attestation_status_unavailable`, `openbao_error`, ...). Every refusal
+also sends that reason code in an `Enroll-Error` response header, so the
+client can tell refusals apart that share a status (a 403 is a disabled
+device only for `device_disabled` and `credential_reuse`); the header
+carries nothing but the fixed code, and the text body stays for logs.
+Fields: remote
 address, device ID, username, label, serial, expiry, as far as known.
 Successful device enrollments also log the attestation security level,
 verified-boot state, device lock state, verified boot key and
