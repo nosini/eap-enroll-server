@@ -100,6 +100,18 @@ current Wi-Fi certificate of this device; `502` means revoking failed
 Until the phone confirms, older Wi-Fi certificates stay valid, so a new
 certificate that doesn't work never leaves the phone without Wi-Fi.
 
+Reaching the service proves nothing about Wi-Fi (the phone may use
+mobile data or a VPN), so the app must not confirm because a request
+succeeded. Android tells the app when it connected through the app's own
+network suggestion: `WifiManager.ACTION_WIFI_NETWORK_SUGGESTION_POST_CONNECTION`,
+sent only for a suggestion built with `setIsAppInteractionRequired(true)`
+and only to an app that may read scan results (precise location
+permission, location on). Once the suggestion holds only the new
+certificate, that broadcast means the new certificate worked; the
+confirmation itself may then go over any network. Without the
+permission, the app doesn't confirm, and older certificates simply
+expire.
+
 ### `wifi/profile`
 
 The network the certificates are for, so the app needs no manual
@@ -113,8 +125,7 @@ settings. `404` if the service has no profile configured.
 }
 ```
 
-- `ssid`: exactly as broadcast; it may contain leading or trailing
-  spaces. Never trim it.
+- `ssid`: the network name.
 - `server_domain`: the RADIUS server's certificate name, for
   `WifiEnterpriseConfig.setDomainSuffixMatch()`.
 - `server_ca_certificates`: the CA certificates that issued the RADIUS

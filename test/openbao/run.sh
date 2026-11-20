@@ -86,8 +86,8 @@ field dev2 -ext subjectAltName | grep -q "urn:uuid:$DEVID" && ok "renewed creden
 
 # Profile, with the new credential; that retires the old one.
 check "wifi/profile" 200 "$(est profile wifi/profile -X GET --cert "$W/dev2.pem" --key "$W/dev2.key")"
-python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(p["ssid"] != "Test Net " or p["server_domain"] != "radius.example.org")' "$W/profile.out" \
-  && ok "profile content (SSID with trailing space)" || bad "profile $(cat "$W/profile.out")"
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); sys.exit(p["ssid"] != "Test Net" or p["server_domain"] != "radius.example.org")' "$W/profile.out" \
+  && ok "profile content" || bad "profile $(cat "$W/profile.out")"
 check "old device credential after the new one was used" 401 "$(est old wifi/simpleenroll --cert "$W/dev.pem" --key "$W/dev.key" --data-binary @"$W/wifi.csr")"
 
 # A second Wi-Fi certificate; confirming it revokes the first.

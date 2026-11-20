@@ -59,9 +59,8 @@ type OpenBao struct {
 	UserGroupsPath string `json:"user_groups_path"`
 }
 
-// WifiProfile is the network the phones configure: SSID (kept exactly,
-// spaces included), the RADIUS server's name and the CA that issued the
-// RADIUS server certificate.
+// WifiProfile is the network the phones configure: SSID, the RADIUS
+// server's name and the CA that issued the RADIUS server certificate.
 type WifiProfile struct {
 	SSID         string `json:"ssid"`
 	ServerDomain string `json:"server_domain"`

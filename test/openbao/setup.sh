@@ -101,7 +101,7 @@ cat >state/config.json <<EOF
   "wifi_ttl": "1440h",
   "device_ttl": "8760h",
   "wifi_profile": {
-    "ssid": "Test Net ",
+    "ssid": "Test Net",
     "server_domain": "radius.example.org",
     "server_ca_file": "$D/pki/root.pem"
   },

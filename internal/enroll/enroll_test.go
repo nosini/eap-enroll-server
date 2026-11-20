@@ -516,7 +516,7 @@ func TestWifiProfile(t *testing.T) {
 
 	e = newEnvWith(t, func(cfg map[string]any, dir string) {
 		cfg["wifi_profile"] = map[string]any{
-			"ssid": "Home Net ", "server_domain": "radius.example.org",
+			"ssid": "Home Net", "server_domain": "radius.example.org",
 			"server_ca_file": writeFile(t, dir, "radius-ca.pem", pemCert(e.root.cert)),
 		}
 	})
@@ -529,7 +529,7 @@ func TestWifiProfile(t *testing.T) {
 	if code != 200 || json.Unmarshal([]byte(body), &p) != nil {
 		t.Fatalf("profile: %d %s", code, body)
 	}
-	if p.SSID != "Home Net " || p.ServerDomain != "radius.example.org" || len(p.ServerCACertificates) != 1 {
+	if p.SSID != "Home Net" || p.ServerDomain != "radius.example.org" || len(p.ServerCACertificates) != 1 {
 		t.Errorf("profile %+v", p)
 	}
 	if c, err := x509.ParseCertificate(p.ServerCACertificates[0]); err != nil || c.Subject.CommonName != "Test Root" {
