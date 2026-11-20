@@ -465,6 +465,64 @@ func (s *Store) Devices(ctx context.Context) ([]DeviceSummary, error) {
 	return out, rows.Err()
 }
 
+// PruneDevices deletes disabled devices whose certificates are all
+// revoked or expired at now, together with their certificate records.
+// Disabled devices that still have a valid unrevoked certificate (their
+// disable didn't finish) are kept and returned as pending, so that
+// rerunning disable can revoke the rest. Enabled devices are never
+// touched.
+func (s *Store) PruneDevices(ctx context.Context, now time.Time) (pruned, pending []Device, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
+		SELECT d.id, d.username, d.label, d.created, d.disabled,
+		  EXISTS (SELECT 1 FROM certificates c
+		          WHERE c.device_id = d.id AND c.revoked IS NULL AND c.not_after > ?)
+		FROM devices d WHERE d.disabled IS NOT NULL ORDER BY d.username, d.created`, unix(now))
+	if err != nil {
+		return nil, nil, err
+	}
+	for rows.Next() {
+		var (
+			d        Device
+			created  int64
+			disabled sql.NullInt64
+			valid    bool
+		)
+		if err := rows.Scan(&d.ID, &d.Username, &d.Label, &created, &disabled, &valid); err != nil {
+			rows.Close()
+			return nil, nil, err
+		}
+		d.Created, d.Disabled = fromUnix(created), fromNullUnix(disabled)
+		if valid {
+			pending = append(pending, d)
+		} else {
+			pruned = append(pruned, d)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	for _, d := range pruned {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM certificates WHERE device_id = ?`, d.ID); err != nil {
+			return nil, nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM devices WHERE id = ?`, d.ID); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return pruned, pending, nil
+}
+
 // DeleteExpiredCodes removes codes (used or not) whose validity ended.
 func (s *Store) DeleteExpiredCodes(ctx context.Context, now time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM codes WHERE expires <= ?`, unix(now))

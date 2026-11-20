@@ -79,6 +79,13 @@ the phone's keystore and that only this service trusts.
 5. `eap-enroll disable ID` marks the device disabled, then revokes its
    unexpired certificates in OpenBao and rotates the CRLs. RADIUS sees
    the revocation after its next CRL fetch.
+6. `eap-enroll prune` deletes disabled devices and their certificate
+   records once every certificate is revoked or expired. A device whose
+   revocation hasn't finished is kept, so rerunning `disable` can
+   complete it. A deleted device's credentials are unknown afterwards and
+   refused with 401 `unknown_cert`, which the app treats like a disabled
+   device (it needs a new code). OpenBao's CRLs still list the revoked
+   certificates, and the journal keeps the audit events.
 
 ## Checks
 
@@ -239,7 +246,7 @@ support).
 JSON lines on standard error (the journal): `code_created`,
 `enroll_device`, `enroll_wifi`, `reenroll_device`, `confirm_wifi`,
 `certificate_issued`, `device_disabled`, `cert_revoked`,
-`credential_reuse`, `code_failures_high`, and `<event>_refused` with a
+`device_deleted`, `credential_reuse`, `code_failures_high`, and `<event>_refused` with a
 `reason` (`bad_code`, `code_used`, `code_expired`, `no_code`,
 `user_disabled`, `device_disabled`, `credential_reuse`, `unknown_cert`,
 `revoked_cert`, `rate_limited`, `too_many_certificates`, `bad_csr`,
@@ -265,7 +272,7 @@ SQLite (WAL) with three tables: one-time codes (hash, user, label,
 expiry, used), devices (ID, user, label, created, disabled), and issued
 certificates (kind, serial, device, expiry, revoked). The server and the
 admin commands use the same file. Expired codes are deleted at start and
-hourly.
+hourly; disabled devices only by `eap-enroll prune`.
 
 ## Dependencies
 

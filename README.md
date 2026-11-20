@@ -60,9 +60,14 @@ eap-enroll devices -config FILE
 # Block a device now and revoke its certificates (rerun to retry after an
 # OpenBao failure):
 eap-enroll disable -config FILE DEVICE_ID
+
+# Delete disabled devices whose certificates are all revoked or expired:
+eap-enroll prune -config FILE
 ```
 
 When a phone is set up again with a new code, disable its old device.
+`prune` then removes it from the database; it keeps a disabled device
+whose revocation didn't finish and says to rerun `disable`.
 The service disables a device by itself when a superseded device
 credential is used again (`credential_reuse` in the log); the phone then
 needs a new code.

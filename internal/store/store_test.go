@@ -125,3 +125,106 @@ func TestCertificateLimits(t *testing.T) {
 		t.Errorf("check after the window: %v", err)
 	}
 }
+
+func TestPruneDevices(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	device := func(n int) Device {
+		t.Helper()
+		hash := []byte(fmt.Sprintf("code-%d", n))
+		if err := s.CreateCode(ctx, hash, "alice", fmt.Sprintf("Phone %d", n), now, now.Add(time.Minute)); err != nil {
+			t.Fatal(err)
+		}
+		d, err := s.UseCode(ctx, hash, fmt.Sprintf("00000000-0000-4000-8000-%012d", n), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	add := func(d Device, kind, serial string, notAfter time.Time) {
+		t.Helper()
+		if err := s.AddCertificate(ctx, Certificate{
+			Serial: serial, Kind: kind, DeviceID: d.ID, Issued: now.Add(-time.Hour), NotAfter: notAfter,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disable := func(d Device) {
+		t.Helper()
+		if _, err := s.DisableDevice(ctx, d.ID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Enabled: never deleted, even without valid certificates.
+	enabled := device(1)
+	add(enabled, KindDevice, "d1", now.Add(-time.Minute))
+	// Disabled, all certificates revoked: deleted.
+	revoked := device(2)
+	add(revoked, KindDevice, "d2", now.Add(time.Hour))
+	add(revoked, KindWifi, "w2", now.Add(time.Hour))
+	disable(revoked)
+	for _, c := range []struct{ kind, serial string }{{KindDevice, "d2"}, {KindWifi, "w2"}} {
+		if err := s.MarkRevoked(ctx, c.kind, c.serial, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Disabled, the unrevoked certificate has expired: deleted.
+	expired := device(3)
+	add(expired, KindWifi, "w3", now.Add(-time.Minute))
+	disable(expired)
+	// Disabled without certificates: deleted.
+	empty := device(4)
+	disable(empty)
+	// Disabled but a certificate is still valid and unrevoked (the
+	// revocation failed): kept for a disable rerun.
+	unfinished := device(5)
+	add(unfinished, KindWifi, "w5", now.Add(time.Hour))
+	disable(unfinished)
+
+	pruned, pending, err := s.PruneDevices(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := func(list []Device) []string {
+		var out []string
+		for _, d := range list {
+			out = append(out, d.ID)
+		}
+		return out
+	}
+	if got, want := fmt.Sprint(ids(pruned)), fmt.Sprint([]string{revoked.ID, expired.ID, empty.ID}); got != want {
+		t.Errorf("pruned %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(ids(pending)), fmt.Sprint([]string{unfinished.ID}); got != want {
+		t.Errorf("pending %s, want %s", got, want)
+	}
+	for _, d := range []Device{revoked, expired, empty} {
+		if _, err := s.Device(ctx, d.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("device %s still there: %v", d.ID, err)
+		}
+	}
+	for _, c := range []struct{ kind, serial string }{{KindDevice, "d2"}, {KindWifi, "w2"}, {KindWifi, "w3"}} {
+		if _, err := s.Certificate(ctx, c.kind, c.serial); !errors.Is(err, ErrNotFound) {
+			t.Errorf("certificate %s %s still there: %v", c.kind, c.serial, err)
+		}
+	}
+	for _, d := range []Device{enabled, unfinished} {
+		if _, err := s.Device(ctx, d.ID); err != nil {
+			t.Errorf("device %s deleted: %v", d.ID, err)
+		}
+	}
+	if _, err := s.Certificate(ctx, KindWifi, "w5"); err != nil {
+		t.Errorf("pending device's certificate deleted: %v", err)
+	}
+
+	// Once the revocation is recorded, the next prune deletes it.
+	if err := s.MarkRevoked(ctx, KindWifi, "w5", now); err != nil {
+		t.Fatal(err)
+	}
+	pruned, pending, err = s.PruneDevices(ctx, now)
+	if err != nil || len(pruned) != 1 || pruned[0].ID != unfinished.ID || len(pending) != 0 {
+		t.Errorf("second prune: %v %v %v", ids(pruned), ids(pending), err)
+	}
+}

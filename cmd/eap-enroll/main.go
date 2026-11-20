@@ -31,6 +31,7 @@ const usage = `usage:
   eap-enroll code -config FILE -user USERNAME -label LABEL
   eap-enroll devices -config FILE
   eap-enroll disable -config FILE DEVICE_ID
+  eap-enroll prune -config FILE
 `
 
 func main() {
@@ -48,6 +49,8 @@ func main() {
 		err = devices(os.Args[2:])
 	case "disable":
 		err = disable(os.Args[2:])
+	case "prune":
+		err = prune(os.Args[2:])
 	case "-h", "-help", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -237,5 +240,26 @@ func disable(args []string) error {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Device %s is disabled and its certificates are revoked.\n", rest[0])
+	return nil
+}
+
+func prune(args []string) error {
+	a, _, err := open("prune", args, 0, 0, nil)
+	if err != nil {
+		return err
+	}
+	defer a.close()
+	pruned, pending, err := a.svc.PruneDevices(context.Background())
+	if err != nil {
+		return err
+	}
+	for _, d := range pruned {
+		fmt.Fprintf(os.Stderr, "Deleted device %s (%s, %s).\n", d.ID, d.Username, d.Label)
+	}
+	fmt.Fprintf(os.Stderr, "%d disabled device(s) deleted.\n", len(pruned))
+	for _, d := range pending {
+		fmt.Fprintf(os.Stderr, "Kept device %s (%s, %s): it still has certificates that aren't revoked; "+
+			"run disable %s again.\n", d.ID, d.Username, d.Label, d.ID)
+	}
 	return nil
 }

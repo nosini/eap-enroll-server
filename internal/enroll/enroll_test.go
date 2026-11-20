@@ -529,6 +529,49 @@ func TestDisableRetriesAfterRotateFailure(t *testing.T) {
 	}
 }
 
+func TestPruneDevices(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	devTLS, devCert := e.enrollDevice("alice")
+	id := strings.TrimPrefix(devCert.URIs[0].String(), "urn:uuid:")
+	other, _ := e.enrollDevice("alice")
+
+	// A disable whose CRL rotation failed leaves the device pending.
+	e.bao.failRot = true
+	if _, err := e.svc.DisableDevice(ctx, id); err == nil {
+		t.Fatal("disable with failing rotate succeeded")
+	}
+	pruned, pending, err := e.svc.PruneDevices(ctx)
+	if err != nil || len(pruned) != 0 || len(pending) != 1 || pending[0].ID != id {
+		t.Fatalf("prune before the revocation: %v %v %v", pruned, pending, err)
+	}
+	e.bao.failRot = false
+	if remaining, err := e.svc.DisableDevice(ctx, id); err != nil || len(remaining) != 0 {
+		t.Fatalf("disable retry: %v %v", remaining, err)
+	}
+
+	pruned, pending, err = e.svc.PruneDevices(ctx)
+	if err != nil || len(pruned) != 1 || pruned[0].ID != id || len(pending) != 0 {
+		t.Fatalf("prune: %v %v %v", pruned, pending, err)
+	}
+	if e.events("device_deleted") != 1 {
+		t.Errorf("device_deleted logged %d times", e.events("device_deleted"))
+	}
+	// The deleted device's credential is now unknown; the other device
+	// is untouched.
+	r := e.post(e.client(devTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+	if r.status != 401 || r.header.Get("Enroll-Error") != "unknown_cert" {
+		t.Errorf("deleted device's credential: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	if r := e.post(e.client(other), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 200 {
+		t.Errorf("other device after prune: %d %s", r.status, r.body)
+	}
+	list, err := e.store.Devices(ctx)
+	if err != nil || len(list) != 1 || list[0].ID == id {
+		t.Errorf("device list after prune: %+v %v", list, err)
+	}
+}
+
 func TestRequestLimits(t *testing.T) {
 	e := newEnv(t)
 	code := e.code("alice", "Phone")

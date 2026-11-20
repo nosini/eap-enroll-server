@@ -657,6 +657,21 @@ func normalizeSerial(v string) string {
 	return openbao.SerialText(n)
 }
 
+// PruneDevices deletes disabled devices whose certificates are all
+// revoked or expired, and returns them and the disabled devices that
+// still need a disable rerun. A deleted device's credentials are unknown
+// afterwards and refused as such (401 unknown_cert).
+func (s *Service) PruneDevices(ctx context.Context) (pruned, pending []store.Device, err error) {
+	pruned, pending, err = s.store.PruneDevices(ctx, s.now())
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, d := range pruned {
+		s.log.Info("device_deleted", "device", d.ID, "username", d.Username, "label", d.Label)
+	}
+	return pruned, pending, nil
+}
+
 // CleanupCodes deletes expired codes.
 func (s *Service) CleanupCodes(ctx context.Context) {
 	n, err := s.store.DeleteExpiredCodes(ctx, s.now())
