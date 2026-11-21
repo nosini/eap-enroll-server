@@ -233,10 +233,19 @@ func disable(args []string) error {
 	if errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("no device %s", rest[0])
 	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Device %s is disabled, but %d certificate(s) are not revoked yet: %v\n",
-			rest[0], len(remaining), remaining)
+	var revErr *enroll.RevocationError
+	if errors.As(err, &revErr) {
+		if len(remaining) > 0 {
+			fmt.Fprintf(os.Stderr, "Device %s is disabled, but %d certificate(s) are not revoked yet: %v\n",
+				rest[0], len(remaining), remaining)
+		} else {
+			fmt.Fprintf(os.Stderr, "Device %s is disabled, but its certificates could not be revoked.\n", rest[0])
+		}
 		fmt.Fprintln(os.Stderr, "Run the same command again to retry.")
+		return err
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Device %s is NOT disabled. Run the same command again.\n", rest[0])
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Device %s is disabled and its certificates are revoked.\n", rest[0])

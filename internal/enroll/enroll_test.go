@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -516,7 +517,8 @@ func TestDisableRetriesAfterRotateFailure(t *testing.T) {
 	id := strings.TrimPrefix(devCert.URIs[0].String(), "urn:uuid:")
 	e.bao.failRot = true
 	remaining, err := e.svc.DisableDevice(context.Background(), id)
-	if err == nil || len(remaining) != 1 {
+	var revErr *RevocationError
+	if !errors.As(err, &revErr) || len(remaining) != 1 {
 		t.Fatalf("disable with failing rotate: %v %v", remaining, err)
 	}
 	e.bao.failRot = false
@@ -526,6 +528,48 @@ func TestDisableRetriesAfterRotateFailure(t *testing.T) {
 	}
 	if _, err := e.svc.DisableDevice(context.Background(), "00000000-0000-4000-8000-000000000000"); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("unknown device: %v", err)
+	}
+}
+
+// When the device can't be marked disabled, the error says so: it is not
+// a RevocationError, and credential reuse isn't reported as disabled.
+func TestDisableFailureIsNotDisabled(t *testing.T) {
+	e := newEnv(t)
+	oldTLS, devCert := e.enrollDevice("alice")
+	id := strings.TrimPrefix(devCert.URIs[0].String(), "urn:uuid:")
+	k := newKey(t, elliptic.P256())
+	r := e.post(e.client(oldTLS), "device/simplereenroll", "", csrBody(t, k, "x"))
+	if r.status != 200 {
+		t.Fatalf("renew: %d %s", r.status, r.body)
+	}
+	if r := e.post(e.client(tlsCert(r.certs, k)), "wifi/confirm", "", []byte("zz")); r.status != 400 {
+		t.Fatalf("renewed credential: %d %s", r.status, r.body)
+	}
+
+	// A trigger makes disabling fail while reads still work.
+	db, err := sql.Open("sqlite", e.svc.cfg.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TRIGGER no_disable BEFORE UPDATE OF disabled ON devices
+		BEGIN SELECT RAISE(ABORT, 'disable blocked'); END`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.svc.DisableDevice(context.Background(), id)
+	var revErr *RevocationError
+	if err == nil || errors.As(err, &revErr) {
+		t.Errorf("failed disable: %v", err)
+	}
+	r = e.post(e.client(oldTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+	if r.status != 500 || e.events("disable_failed") != 1 {
+		t.Errorf("reuse while disabling fails: %d %s, disable_failed %d", r.status, r.body, e.events("disable_failed"))
+	}
+	if _, err := db.Exec(`DROP TRIGGER no_disable`); err != nil {
+		t.Fatal(err)
+	}
+	if r := e.post(e.client(oldTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 {
+		t.Errorf("reuse once disabling works: %d %s", r.status, r.body)
 	}
 }
 

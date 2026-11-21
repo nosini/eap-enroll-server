@@ -542,10 +542,16 @@ func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certifica
 		s.log.Error("credential_reuse", "device", dev.ID, "username", dev.Username,
 			"label", dev.Label, "serial", serial)
 		remaining, err := s.DisableDevice(context.WithoutCancel(ctx), dev.ID)
-		if err != nil {
-			// The device is disabled anyway; an admin reruns
-			// `eap-enroll disable` to revoke the rest.
+		var revErr *RevocationError
+		switch {
+		case errors.As(err, &revErr):
+			// The device is disabled; an admin reruns `eap-enroll
+			// disable` to revoke the rest.
 			s.log.Error("revoke_failed", "device", dev.ID, "serials", remaining, "error", err.Error())
+		case err != nil:
+			// Not disabled: the next use of the credential tries again.
+			s.log.Error("disable_failed", "device", dev.ID, "error", err.Error())
+			return dev, "", fail(500, "store_error", "internal error", err)
 		}
 		return dev, "", fail(403, "credential_reuse", "device is disabled", nil)
 	}
@@ -570,9 +576,22 @@ func (s *Service) ReenrollDevice(ctx context.Context, dev store.Device, csr *x50
 	return s.sign(ctx, s.deviceProfile(), dev, csr)
 }
 
+// RevocationError is DisableDevice's error once the device is disabled:
+// some of its certificates aren't revoked yet. Any other error means the
+// device was not disabled.
+type RevocationError struct {
+	Err error
+}
+
+func (e *RevocationError) Error() string {
+	return "device disabled, but revoking its certificates failed: " + e.Err.Error()
+}
+
+func (e *RevocationError) Unwrap() error { return e.Err }
+
 // DisableDevice blocks a device at once and revokes its certificates. It
-// returns the serials that are still to be revoked when OpenBao fails;
-// running it again retries them.
+// returns the serials that are still to be revoked when OpenBao fails,
+// with a *RevocationError; running it again retries them.
 func (s *Service) DisableDevice(ctx context.Context, id string) ([]string, error) {
 	now := s.now()
 	dev, err := s.store.DisableDevice(ctx, id, now)
@@ -582,9 +601,13 @@ func (s *Service) DisableDevice(ctx context.Context, id string) ([]string, error
 	s.log.Info("device_disabled", "device", dev.ID, "username", dev.Username, "label", dev.Label)
 	certs, err := s.store.UnrevokedCertificates(ctx, id, now)
 	if err != nil {
-		return nil, err
+		return nil, &RevocationError{Err: err}
 	}
-	return s.revoke(ctx, dev, certs, "device disabled")
+	remaining, err := s.revoke(ctx, dev, certs, "device disabled")
+	if err != nil {
+		return remaining, &RevocationError{Err: err}
+	}
+	return nil, nil
 }
 
 // revoke revokes certificates of a device. Per mount: revoke all, rotate

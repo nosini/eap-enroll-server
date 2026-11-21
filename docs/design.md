@@ -252,7 +252,8 @@ support).
 JSON lines on standard error (the journal): `code_created`,
 `enroll_device`, `enroll_wifi`, `reenroll_device`, `confirm_wifi`,
 `certificate_issued`, `device_disabled`, `cert_revoked`,
-`device_deleted`, `credential_reuse`, `code_failures_high`, and `<event>_refused` with a
+`device_deleted`, `credential_reuse`, `disable_failed`, `revoke_failed`,
+`code_failures_high`, and `<event>_refused` with a
 `reason` (`bad_code`, `code_used`, `code_expired`, `no_code`,
 `user_disabled`, `device_disabled`, `credential_reuse`, `unknown_cert`,
 `revoked_cert`, `rate_limited`, `too_many_certificates`, `bad_csr`,
