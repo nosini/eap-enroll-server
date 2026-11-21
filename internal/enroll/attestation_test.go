@@ -182,7 +182,7 @@ func newAttestationEnv(t *testing.T, keepStatus bool) (*env, *ca, *ca) {
 // postAttested is post with a Key-Attestation header.
 func (e *env) postAttested(client *http.Client, path, bearer string, body []byte, header string) result {
 	e.t.Helper()
-	e.now = e.now.Add(time.Duration(float64(time.Second) / postRate))
+	e.advance(time.Duration(float64(time.Second) / postRate))
 	req, err := http.NewRequest(http.MethodPost, e.srv.URL+estPrefix+path, bytes.NewReader(body))
 	if err != nil {
 		e.t.Fatal(err)

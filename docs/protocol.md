@@ -33,6 +33,14 @@ TLS 1.3 only. The server asks for a client certificate but doesn't
 require one; requests without a valid one fail on the endpoints that
 need it (401).
 
+The server doesn't resume TLS sessions, so every new connection
+presents the credential the phone holds now. A connection keeps the
+client certificate of its handshake, though: after switching to a
+renewed device credential (see
+[Device credential renewal](#device-credential-renewal)), close the
+HTTP client's pooled connections and drop its TLS session cache before
+the next request.
+
 ## Endpoints
 
 All paths are under `/.well-known/est/`.
@@ -86,6 +94,7 @@ credential instead.
 | --- | --- | --- |
 | 400 | Malformed body, bad CSR, wrong key type, or missing/malformed key attestation when required (`bad_attestation`) | Fix the request; don't retry as is |
 | 401 | Missing, wrong, used or expired code; missing, unknown or expired device credential | Setup needs a new code |
+| 401 (`credential_superseded`) | The request came over a connection opened with a device credential that has since been replaced | Close the connection and retry with the current credential |
 | 403 | Device or user disabled, a superseded device credential was reused, or key attestation was refused (`attestation_refused`) | Stop; tell the user |
 | 413 | Body too large | Don't retry |
 | 429 | Rate limited or too many certificates for this device; `Retry-After` in seconds | Wait at least that long |
@@ -222,7 +231,11 @@ Once the phone has stored the renewed credential it must never use the
 old one again, and it must not send requests with the old credential
 concurrently with the renewal. Using a superseded credential is treated
 as a copied credential: the service disables the device, revokes its
-certificates and answers 403. The device then needs a new code.
+certificates and answers 403. The device then needs a new code. The one
+exception is a connection that was opened before the credential was
+superseded, such as a pooled keep-alive or HTTP/2 connection: requests
+on it get `401 credential_superseded` and the device stays enabled.
+Close such connections when switching, as described under [TLS](#tls).
 
 When a phone is set up again, disable its old device with
 `eap-enroll disable` instead of leaving it to expire.

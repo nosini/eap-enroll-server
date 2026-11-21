@@ -5,6 +5,7 @@
 package enroll
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/elliptic"
@@ -150,7 +151,7 @@ func TestPerDeviceCertificateLimits(t *testing.T) {
 	}
 
 	// Once the window has passed it works again.
-	e.now = e.now.Add(24*time.Hour + time.Minute)
+	e.advance(24*time.Hour + time.Minute)
 	issueWifi()
 }
 
@@ -194,7 +195,7 @@ func TestLostRenewalAnswers(t *testing.T) {
 			t.Fatalf("lost renewal %d: %d %s", i, r.status, r.body)
 		}
 	}
-	e.now = e.now.Add(30 * 24 * time.Hour)
+	e.advance(30 * 24 * time.Hour)
 	k := newKey(t, elliptic.P256())
 	r := e.post(device, "device/simplereenroll", "", csrBody(t, k, "x"))
 	if r.status != 200 {
@@ -537,5 +538,74 @@ func TestUnusableSignAnswerRevoked(t *testing.T) {
 	}
 	if got := e.bao.revoked["pki-enroll"]; len(got) != 1 || got[0] != colonHex(e.bao.issued[0].SerialNumber) {
 		t.Errorf("device credential not revoked: %v", got)
+	}
+}
+
+// The server doesn't resume TLS sessions: a resumed session would carry
+// the credential of its first handshake after the phone switched to the
+// renewed one, and that would count as reuse.
+func TestNoSessionResumption(t *testing.T) {
+	e := newEnv(t)
+	oldTLS, _ := e.enrollDevice("alice")
+	current := oldTLS
+	pool := x509.NewCertPool()
+	pool.AddCert(e.setupCA.cert)
+	tr := &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs: pool, ServerName: "enroll.test", MinVersion: tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(8),
+		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return current, nil
+		},
+	}}
+	phone := &http.Client{Transport: tr}
+
+	k := newKey(t, elliptic.P256())
+	r := e.post(phone, "device/simplereenroll", "", csrBody(t, k, "x"))
+	if r.status != 200 {
+		t.Fatalf("renew: %d %s", r.status, r.body)
+	}
+	current = tlsCert(r.certs, k)
+	tr.CloseIdleConnections()
+	// Another connection uses the renewed credential first.
+	if r := e.post(e.client(current), "wifi/confirm", "", []byte("zz")); r.status != 400 {
+		t.Fatalf("renewed credential: %d %s", r.status, r.body)
+	}
+	// The phone's next connection does a full handshake with it.
+	req, _ := http.NewRequest(http.MethodPost, e.srv.URL+estPrefix+"wifi/simpleenroll",
+		bytes.NewReader(csrBody(t, newKey(t, elliptic.P384()), "x")))
+	resp, err := phone.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || resp.TLS.DidResume {
+		t.Errorf("after switching: %d, resumed %v", resp.StatusCode, resp.TLS.DidResume)
+	}
+	if n := e.events("credential_reuse"); n != 0 {
+		t.Errorf("credential_reuse logged %d times", n)
+	}
+}
+
+// A superseded credential on a connection opened before it was superseded
+// is refused without disabling the device; on a new connection it is reuse.
+func TestSupersededOnOldConnection(t *testing.T) {
+	e := newEnv(t)
+	oldTLS, _ := e.enrollDevice("alice")
+	phone := e.client(oldTLS) // keeps its connection open
+	k := newKey(t, elliptic.P256())
+	r := e.post(phone, "device/simplereenroll", "", csrBody(t, k, "x"))
+	if r.status != 200 {
+		t.Fatalf("renew: %d %s", r.status, r.body)
+	}
+	if r := e.post(e.client(tlsCert(r.certs, k)), "wifi/confirm", "", []byte("zz")); r.status != 400 {
+		t.Fatalf("renewed credential: %d %s", r.status, r.body)
+	}
+	r = e.post(phone, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+	if r.status != 401 || r.header.Get("Enroll-Error") != "credential_superseded" {
+		t.Errorf("old connection: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	r = e.post(e.client(oldTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+	if r.status != 403 || r.header.Get("Enroll-Error") != "credential_reuse" {
+		t.Errorf("new connection: %d %q", r.status, r.header.Get("Enroll-Error"))
 	}
 }

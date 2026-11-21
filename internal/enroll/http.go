@@ -6,6 +6,7 @@ package enroll
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/sha256"
 	"crypto/tls"
@@ -16,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -528,7 +530,27 @@ func (s *Service) TLSConfig() (*tls.Config, error) {
 		ClientAuth:     tls.VerifyClientCertIfGiven,
 		ClientCAs:      pool,
 		NextProtos:     []string{"h2", "http/1.1"},
+		// A resumed session carries the client certificate of its first
+		// handshake, which may be a device credential the phone has
+		// since replaced; presenting that is reuse.
+		SessionTicketsDisabled: true,
 	}, nil
+}
+
+// connOpenedKey is the context key for when a connection was accepted.
+type connOpenedKey struct{}
+
+// ConnContext records when a connection was accepted, so a device
+// credential that was superseded after that can be told from one that
+// was presented again later; http.Server.ConnContext.
+func (s *Service) ConnContext(ctx context.Context, _ net.Conn) context.Context {
+	return context.WithValue(ctx, connOpenedKey{}, s.now())
+}
+
+// connOpened returns when the request's connection was accepted, if known.
+func connOpened(ctx context.Context) (time.Time, bool) {
+	t, ok := ctx.Value(connOpenedKey{}).(time.Time)
+	return t, ok
 }
 
 // clientCAPool loads the device CA. It refuses self-signed certificates:
@@ -566,6 +588,7 @@ func (s *Service) Server() (*http.Server, error) {
 		Addr:              s.cfg.Listen,
 		Handler:           handler,
 		TLSConfig:         tlsConfig,
+		ConnContext:       s.ConnContext,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

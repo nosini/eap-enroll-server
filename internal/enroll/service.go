@@ -535,7 +535,7 @@ func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certifica
 		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	}
 	if cert.Revoked != nil || cert.Superseded != nil {
-		return dev, "", s.credentialReuse(ctx, dev, serial)
+		return dev, "", s.credentialReuse(ctx, dev, cert)
 	}
 	if !s.now().Before(cert.NotAfter) {
 		return dev, "", fail(401, "expired_cert", "client certificate expired", nil)
@@ -545,7 +545,11 @@ func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certifica
 	err = s.store.UseCredential(ctx, dev.ID, serial, s.now())
 	switch {
 	case errors.Is(err, store.ErrSuperseded):
-		return dev, "", s.credentialReuse(ctx, dev, serial)
+		// Superseded since it was read above: read it again for when.
+		if cert, err = s.store.Certificate(ctx, store.KindDevice, serial); err != nil {
+			return dev, "", fail(500, "store_error", "internal error", err)
+		}
+		return dev, "", s.credentialReuse(ctx, dev, cert)
 	case errors.Is(err, store.ErrNotFound):
 		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
 	case err != nil:
@@ -554,16 +558,24 @@ func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certifica
 	return dev, serial, nil
 }
 
-// credentialReuse handles a superseded device credential presented while
-// its device is enabled. Only a newer credential's first use, or a
-// renewal that replaced it before it was used, supersedes a credential of
-// an enabled device. So someone other than the owner may hold a valid
-// credential (or the phone kept using the old one, which can't be told
-// apart): disable the device. The owner gets a new code and the copy stops
-// working.
-func (s *Service) credentialReuse(ctx context.Context, dev store.Device, serial string) error {
+// credentialReuse handles a superseded (or revoked) device credential
+// presented while its device is enabled. Only a newer credential's first
+// use, or a renewal that replaced it before it was used, supersedes a
+// credential of an enabled device. So someone other than the owner may
+// hold a valid credential (or the phone kept using the old one, which
+// can't be told apart): disable the device. The owner gets a new code and
+// the copy stops working.
+//
+// The exception is a connection accepted before the credential was
+// superseded: the phone may still have it open (keep-alive, HTTP/2)
+// after switching to the renewed credential. That request is refused
+// with 401 credential_superseded, and the phone reconnects.
+func (s *Service) credentialReuse(ctx context.Context, dev store.Device, cert store.Certificate) error {
+	if opened, ok := connOpened(ctx); ok && cert.Superseded != nil && opened.Unix() <= cert.Superseded.Unix() {
+		return fail(401, "credential_superseded", "client certificate was replaced; reconnect with the current one", nil)
+	}
 	s.log.Error("credential_reuse", "device", dev.ID, "username", dev.Username,
-		"label", dev.Label, "serial", serial)
+		"label", dev.Label, "serial", cert.Serial)
 	remaining, err := s.DisableDevice(context.WithoutCancel(ctx), dev.ID)
 	var revErr *RevocationError
 	switch {

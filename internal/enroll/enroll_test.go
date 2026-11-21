@@ -42,7 +42,7 @@ func TestFullLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := e.now.Add(15 * time.Minute); !expires.Equal(want) {
+	if want := e.time().Add(15 * time.Minute); !expires.Equal(want) {
 		t.Errorf("expires %v, want %v", expires, want)
 	}
 	u, err := url.Parse(uri)
@@ -94,7 +94,8 @@ func TestFullLifecycle(t *testing.T) {
 	}
 
 	// Wi-Fi certificate with the device credential.
-	device := e.client(tlsCert(r.certs, deviceKey))
+	devTLS := tlsCert(r.certs, deviceKey)
+	device := e.client(devTLS)
 	wifiKey := newKey(t, elliptic.P384())
 	r = e.post(device, "wifi/simpleenroll", "", csrBody(t, wifiKey, "CN=other"))
 	if r.status != 200 {
@@ -138,7 +139,17 @@ func TestFullLifecycle(t *testing.T) {
 	if !contains(e.bao.revoked["pki-enroll"], colonHex(devCert.SerialNumber)) || e.bao.rotates["pki-enroll"] != 1 {
 		t.Errorf("old device credential not revoked: %v %v", e.bao.revoked, e.bao.rotates)
 	}
-	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 || !strings.Contains(r.body, "device is disabled") {
+	// A connection opened before the switch still carries the old
+	// credential; the phone has to reconnect.
+	if r := e.post(device, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 401 ||
+		r.header.Get("Enroll-Error") != "credential_superseded" {
+		t.Errorf("old connection after the switch: %d %q %s", r.status, r.header.Get("Enroll-Error"), r.body)
+	}
+	if e.events("credential_reuse") != 0 {
+		t.Errorf("old connection counted as reuse")
+	}
+	// Presenting the old credential on a new connection is reuse.
+	if r := e.post(e.client(devTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 || !strings.Contains(r.body, "device is disabled") {
 		t.Errorf("old credential after the new one was used: %d %s", r.status, r.body)
 	}
 	if e.events("credential_reuse") != 1 {
@@ -204,7 +215,7 @@ func TestCodeFailures(t *testing.T) {
 
 	// Expired.
 	code := e.code("alice", "Phone")
-	e.now = e.now.Add(16 * time.Minute)
+	e.advance(16 * time.Minute)
 	if r := e.post(c, "device/simpleenroll", code, csrBody(t, key, "x")); r.status != 401 {
 		t.Errorf("expired code: %d", r.status)
 	}
@@ -262,7 +273,7 @@ func TestEnrollErrorHeader(t *testing.T) {
 		t.Errorf("wrong code: %d %q", r.status, r.header.Get("Enroll-Error"))
 	}
 	code := e.code("alice", "Phone")
-	e.now = e.now.Add(16 * time.Minute)
+	e.advance(16 * time.Minute)
 	if r := e.post(c, "device/simpleenroll", code, csrBody(t, key, "x")); r.status != 401 ||
 		r.header.Get("Enroll-Error") != "code_expired" {
 		t.Errorf("expired code: %d %q", r.status, r.header.Get("Enroll-Error"))
@@ -300,7 +311,7 @@ func TestCodeRateLimit(t *testing.T) {
 	}
 	// Once the bucket has refilled, the block still refuses wrong codes,
 	// but not a valid one.
-	e.now = e.now.Add(time.Minute)
+	e.advance(time.Minute)
 	if r := e.postDirect(remote, "device/simpleenroll", "WRONGCODE", body); r.status != 429 {
 		t.Errorf("blocked code: %d", r.status)
 	}
@@ -473,7 +484,7 @@ func TestForeignClientCertificates(t *testing.T) {
 	// A revoked device credential of an enabled device is a superseded
 	// one being reused: the device is disabled.
 	if err := e.store.MarkRevoked(context.Background(), store.KindDevice,
-		openbao.SerialText(devCert.SerialNumber), e.now); err != nil {
+		openbao.SerialText(devCert.SerialNumber), e.time()); err != nil {
 		t.Fatal(err)
 	}
 	if r := e.post(e.client(devTLS), "wifi/simpleenroll", "", body); r.status != 403 || !strings.Contains(r.body, "device is disabled") {

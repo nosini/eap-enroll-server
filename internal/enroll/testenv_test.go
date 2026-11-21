@@ -300,8 +300,27 @@ type env struct {
 	store    *store.Store
 	srv      *httptest.Server
 	handler  http.Handler
-	now      time.Time
 	logs     *bytes.Buffer
+	// clock is the service's time. The server reads it on its own
+	// goroutines (ConnContext), so it is locked.
+	clock struct {
+		sync.Mutex
+		t time.Time
+	}
+}
+
+// time returns the service's current time.
+func (e *env) time() time.Time {
+	e.clock.Lock()
+	defer e.clock.Unlock()
+	return e.clock.t
+}
+
+// advance moves the service's clock forward.
+func (e *env) advance(d time.Duration) {
+	e.clock.Lock()
+	defer e.clock.Unlock()
+	e.clock.t = e.clock.t.Add(d)
 }
 
 func newEnv(t *testing.T) *env {
@@ -313,7 +332,8 @@ func newEnv(t *testing.T) *env {
 func newEnvWith(t *testing.T, change func(cfg map[string]any, dir string)) *env {
 	t.Helper()
 	dir := t.TempDir()
-	e := &env{t: t, now: time.Now()}
+	e := &env{t: t}
+	e.clock.t = time.Now()
 	e.root = newRoot(t, "Test Root")
 	e.wifiCA = e.root.intermediate(t, "Test Wi-Fi CA")
 	e.deviceCA = e.root.intermediate(t, "Test Device CA")
@@ -374,7 +394,7 @@ func newEnvWith(t *testing.T, change func(cfg map[string]any, dir string)) *env 
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.svc.now = func() time.Time { return e.now }
+	e.svc.now = e.time
 	handler, err := e.svc.Handler()
 	if err != nil {
 		t.Fatal(err)
@@ -386,6 +406,7 @@ func newEnvWith(t *testing.T, change func(cfg map[string]any, dir string)) *env 
 	}
 	e.srv = httptest.NewUnstartedServer(handler)
 	e.srv.TLS = tlsConfig
+	e.srv.Config.ConnContext = e.svc.ConnContext
 	e.srv.StartTLS()
 	t.Cleanup(e.srv.Close)
 	return e
@@ -426,7 +447,7 @@ type result struct {
 // interval per request, so only tests about rate limits hit them.
 func (e *env) post(client *http.Client, path, bearer string, body []byte) result {
 	e.t.Helper()
-	e.now = e.now.Add(time.Duration(float64(time.Second) / postRate))
+	e.advance(time.Duration(float64(time.Second) / postRate))
 	return e.httpPost(client, path, bearer, body)
 }
 
