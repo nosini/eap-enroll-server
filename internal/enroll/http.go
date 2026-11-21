@@ -35,6 +35,9 @@ import (
 // maxBody bounds an EST request body (a base64 CSR is well below 2 KiB).
 const maxBody = 16 << 10
 
+// maxConfirmBody bounds a wifi/confirm body, a serial in hex.
+const maxConfirmBody = 256
+
 // maxAttestationHeader matches the server's MaxHeaderBytes. A larger
 // header is refused with 400 rather than reaching the TLS stack.
 const maxAttestationHeader = 16 << 10
@@ -416,7 +419,12 @@ func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
 // certificate the phone has connected with and revokes the older ones.
 func (s *Service) handleConfirm(w http.ResponseWriter, r *http.Request, dev store.Device, _ string) {
 	const event = "confirm_wifi"
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxConfirmBody))
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		s.refuse(w, r, event, fail(413, "body_too_large", "request too large", nil), "device", dev.ID)
+		return
+	}
 	if err != nil {
 		s.refuse(w, r, event, fail(400, "bad_request", "could not read request", nil), "device", dev.ID)
 		return

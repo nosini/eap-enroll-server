@@ -634,6 +634,11 @@ func TestRequestLimits(t *testing.T) {
 	if r := e.post(e.client(nil), "device/simpleenroll", code, big); r.status != 413 {
 		t.Errorf("large body: %d", r.status)
 	}
+	devTLS, _ := e.enrollDevice("alice")
+	if r := e.post(e.client(devTLS), "wifi/confirm", "", bytes.Repeat([]byte("a"), maxConfirmBody+1)); r.status != 413 ||
+		r.header.Get("Enroll-Error") != "body_too_large" {
+		t.Errorf("large confirm body: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
 	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+estPrefix+"device/simpleenroll", nil)
 	if r := e.do(e.client(nil), req); r.status != 405 {
 		t.Errorf("GET simpleenroll: %d", r.status)
