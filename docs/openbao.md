@@ -132,7 +132,10 @@ bao write auth/approle/role/eap-enroll \
 ```
 
 The service logs in again whenever its token is about to expire or
-OpenBao refuses it, so the token needn't be renewable. It revokes the
+OpenBao refuses it, so the token needn't be renewable. A refusal within a
+minute of logging in counts as a policy denial instead (for example a
+TTL spelled differently from the policy's): the request fails, and the
+token stays, so requests that are using it aren't cut off. It revokes the
 token it replaces and, when it or an admin command exits, its current
 token, so a leaked token stays usable only as long as the process still
 uses it.

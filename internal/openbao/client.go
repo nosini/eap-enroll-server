@@ -69,10 +69,19 @@ type Client struct {
 	base *url.URL
 	http *http.Client
 
-	mu      sync.Mutex
-	token   string
-	expires time.Time
+	now func() time.Time
+
+	mu       sync.Mutex
+	token    string
+	expires  time.Time
+	loggedIn time.Time
 }
+
+// reloginAfter is how old a token must be before a 403 counts as expired
+// or revoked. A younger one was refused by the policy (for example a TTL
+// spelled differently from the policy's), and logging in again would only
+// revoke the token other requests are using.
+const reloginAfter = time.Minute
 
 // New creates a client; it doesn't contact OpenBao yet.
 func New(cfg config.OpenBao) (*Client, error) {
@@ -104,6 +113,7 @@ func New(cfg config.OpenBao) (*Client, error) {
 	return &Client{
 		cfg:  cfg,
 		base: base,
+		now:  time.Now,
 		http: &http.Client{
 			Transport: transport,
 			// OpenBao doesn't redirect these calls; a redirect would
@@ -183,7 +193,8 @@ func (c *Client) raw(ctx context.Context, method, path, token string, body, out 
 
 // currentToken returns a valid token, logging in when there is none or it
 // is about to expire. failed is a token OpenBao refused: it is replaced
-// unless another request has replaced it already. A replaced token is
+// unless another request has replaced it already or it is younger than
+// reloginAfter (then the same token comes back). A replaced token is
 // revoked, so it doesn't stay usable until its TTL ends.
 func (c *Client) currentToken(ctx context.Context, failed string) (string, error) {
 	c.mu.Lock()
@@ -200,7 +211,8 @@ func (c *Client) currentToken(ctx context.Context, failed string) (string, error
 // loginLocked is currentToken's part under c.mu. It also returns the token
 // it replaced, if any.
 func (c *Client) loginLocked(ctx context.Context, failed string) (token, old string, err error) {
-	if c.token != "" && c.token != failed && time.Now().Before(c.expires) {
+	valid := c.token != "" && c.now().Before(c.expires)
+	if valid && (c.token != failed || c.now().Sub(c.loggedIn) < reloginAfter) {
 		return c.token, "", nil
 	}
 	old, c.token = c.token, ""
@@ -259,12 +271,14 @@ func (c *Client) login(ctx context.Context) (string, error) {
 		lease, margin = 5*time.Minute, 0
 	}
 	c.token = resp.Auth.ClientToken
-	c.expires = time.Now().Add(lease - margin)
+	c.loggedIn = c.now()
+	c.expires = c.loggedIn.Add(lease - margin)
 	return c.token, nil
 }
 
 // call sends an authenticated request; on 403 it logs in again once and
-// retries, since an expired or revoked token also answers 403.
+// retries, since an expired or revoked token also answers 403, unless the
+// token is too young for that (reloginAfter).
 func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
 	token, err := c.currentToken(ctx, "")
 	if err != nil {
@@ -273,10 +287,15 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) e
 	err = c.raw(ctx, method, path, token, body, out)
 	var e *Error
 	if errors.As(err, &e) && e.Status == http.StatusForbidden {
-		if token, err = c.currentToken(ctx, token); err != nil {
+		next, lerr := c.currentToken(ctx, token)
+		if lerr != nil {
+			return lerr
+		}
+		if next == token {
+			// Too young to have expired: the policy refused it.
 			return err
 		}
-		err = c.raw(ctx, method, path, token, body, out)
+		err = c.raw(ctx, method, path, next, body, out)
 	}
 	return err
 }

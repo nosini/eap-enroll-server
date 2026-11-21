@@ -16,18 +16,20 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nosini/eap-enroll-server/internal/config"
 )
 
 // TestTokenRevocation checks that a token replaced after a 403 and the
-// token left at Close are revoked.
+// token left at Close are revoked, and that a 403 for a fresh token (a
+// policy denial) doesn't log in again.
 func TestTokenRevocation(t *testing.T) {
 	var (
 		mu      sync.Mutex
 		logins  int
 		revoked []string
-		refused = map[string]bool{"t1": true} // t1 "expired" on the server
+		refused = map[string]bool{}
 	)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -73,15 +75,32 @@ func TestTokenRevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	now := time.Now()
+	c.now = func() time.Time { return now }
 	ctx := context.Background()
+	check := func(step string, wantLogins int, wantRevoked ...string) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		if logins != wantLogins || !slices.Equal(revoked, wantRevoked) {
+			t.Errorf("%s: %d logins, revoked %v; want %d, %v", step, logins, revoked, wantLogins, wantRevoked)
+		}
+	}
 	if _, err := c.EnabledUser(ctx, "alice"); err != nil {
 		t.Fatal(err)
 	}
+	check("first request", 1)
+
+	// t1 is a few minutes old when OpenBao refuses it: expired or
+	// revoked, so log in again and revoke it.
+	now = now.Add(2 * reloginAfter)
 	mu.Lock()
-	if logins != 2 || !slices.Equal(revoked, []string{"t1"}) {
-		t.Errorf("after a refused token: %d logins, revoked %v; want 2, [t1]", logins, revoked)
-	}
+	refused["t1"] = true
 	mu.Unlock()
+	if _, err := c.EnabledUser(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	check("after an old token was refused", 2, "t1")
 
 	// A request that failed with a token another request has replaced
 	// already uses the new one instead of logging in again.
@@ -89,14 +108,20 @@ func TestTokenRevocation(t *testing.T) {
 		t.Errorf("currentToken after replacement: %q, %v", token, err)
 	}
 
+	// t2 is fresh when OpenBao refuses it: the policy denies the
+	// request, so the error comes back and t2 stays.
+	mu.Lock()
+	refused["t2"] = true
+	mu.Unlock()
+	if _, err := c.EnabledUser(ctx, "alice"); err == nil {
+		t.Error("request refused by the policy succeeded")
+	}
+	check("after a fresh token was refused", 2, "t1")
+
 	if err := c.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if logins != 2 || !slices.Equal(revoked, []string{"t1", "t2"}) {
-		t.Errorf("after Close: %d logins, revoked %v; want 2, [t1 t2]", logins, revoked)
-	}
+	check("after Close", 2, "t1", "t2")
 }
 
 func TestNewRequiresCA(t *testing.T) {
