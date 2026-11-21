@@ -169,9 +169,11 @@ func (c *Config) validate() error {
 	}
 	need("listen", c.Listen)
 	need("database", c.Database)
+	// It goes into the QR code verbatim and the client appends
+	// /.well-known/est/..., so not even a trailing slash.
 	if u, err := url.Parse(c.PublicURL); err != nil || u.Scheme != "https" || u.Host == "" ||
-		u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-		errs = append(errs, errors.New("public_url must be https://host[:port] without path or query"))
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path != "" || u.Opaque != "" {
+		errs = append(errs, errors.New("public_url must be https://host[:port] without path (not even /), query or fragment"))
 	}
 	file("tls_cert_file", c.TLSCertFile, false)
 	file("tls_key_file", c.TLSKeyFile, false)

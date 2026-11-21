@@ -31,7 +31,7 @@ fields are errors.
 | Field | Meaning |
 | --- | --- |
 | `listen` | Listen address. The service terminates TLS itself, because it needs the client certificate and the client's address. |
-| `public_url` | URL the phones use, `https://host[:port]`. |
+| `public_url` | URL the phones use, `https://host[:port]`, without a path or trailing slash. |
 | `tls_cert_file`, `tls_key_file` | Server certificate chain and key. The chain must include the `setup_ca_file` certificate. Changed files are picked up within a minute. |
 | `setup_ca_file` | One CA certificate from the server's chain; its fingerprint goes into the QR code and the phone pins it. |
 | `device_ca_file` | The device credential intermediate (`pki-enroll`) only, never the root it shares with other CAs. Self-signed certificates are refused. |
