@@ -78,27 +78,38 @@ func TestKeyAttestation(t *testing.T) {
 		t.Fatalf("key_attestation: %+v", a)
 	}
 
-	for name, change := range map[string]func(a map[string]any){
-		"missing roots":         func(a map[string]any) { delete(a, "roots_file") },
-		"http status url":       func(a map[string]any) { a["status_url"] = "http://enroll.example.org/status" },
-		"invalid boot key":      func(a map[string]any) { a["verified_boot_keys"] = []string{"not-hex"} },
-		"empty boot key":        func(a map[string]any) { a["verified_boot_keys"] = []string{""} },
-		"package without certs": func(a map[string]any) { a["app_package"] = "org.example.eapenroll" },
-		"certs without package": func(a map[string]any) { a["app_signing_certs"] = []string{digest} },
-		"short app digest": func(a map[string]any) {
-			a["app_package"] = "org.example.eapenroll"
-			a["app_signing_certs"] = []string{"ab"}
-		},
-	} {
+	cases := map[string]func(a map[string]any){
+		"complete":           func(a map[string]any) {},
+		"missing roots":      func(a map[string]any) { delete(a, "roots_file") },
+		"no status url":      func(a map[string]any) { delete(a, "status_url") },
+		"http status url":    func(a map[string]any) { a["status_url"] = "http://enroll.example.org/status" },
+		"invalid boot key":   func(a map[string]any) { a["verified_boot_keys"] = []string{"not-hex"} },
+		"empty boot key":     func(a map[string]any) { a["verified_boot_keys"] = []string{""} },
+		"no app package":     func(a map[string]any) { delete(a, "app_package") },
+		"no app certs":       func(a map[string]any) { delete(a, "app_signing_certs") },
+		"no app check":       func(a map[string]any) { delete(a, "app_package"); delete(a, "app_signing_certs") },
+		"short app digest":   func(a map[string]any) { a["app_signing_certs"] = []string{"ab"} },
+		"non-hex app digest": func(a map[string]any) { a["app_signing_certs"] = []string{strings.Repeat("zz", 32)} },
+	}
+	for name, change := range cases {
 		dir, v := valid(t)
 		roots := filepath.Join(dir, "att-roots.pem")
 		if err := os.WriteFile(roots, []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		a := map[string]any{"roots_file": roots}
+		a := map[string]any{
+			"roots_file":        roots,
+			"status_url":        "https://android.googleapis.com/attestation/status",
+			"app_package":       "org.example.eapenroll",
+			"app_signing_certs": []string{digest},
+		}
 		change(a)
 		v["key_attestation"] = a
-		if _, err := Load(write(t, dir, v)); err == nil {
+		_, err := Load(write(t, dir, v))
+		if name == "complete" && err != nil {
+			t.Errorf("complete key_attestation refused: %v", err)
+		}
+		if name != "complete" && err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}

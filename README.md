@@ -40,7 +40,7 @@ fields are errors.
 | `code_ttl` | Lifetime of one-time codes (default 15m, at most 24h). |
 | `wifi_ttl`, `device_ttl` | Certificate lifetimes, sent to OpenBao verbatim as `ttl`. |
 | `wifi_profile` | Optional: `ssid`, `server_domain` (RADIUS server certificate name) and `server_ca_file` (CA of the RADIUS server certificate), served at `wifi/profile`. |
-| `key_attestation` | Optional: require Android hardware key attestation for device credentials. `roots_file` (PEM, required; [deploy/attestation-roots.pem](deploy/attestation-roots.pem) holds Google's current roots), `status_url` (optional public revocation list), `require_strongbox`, `verified_boot_keys` (hex), and `app_package` with `app_signing_certs` (hex SHA-256). Wi-Fi certificates are unaffected. |
+| `key_attestation` | Optional: require Android hardware key attestation for device credentials. `roots_file` (PEM, required; [deploy/attestation-roots.pem](deploy/attestation-roots.pem) holds Google's current roots), `status_url` (required: Google's public revocation list), `app_package` and `app_signing_certs` (required: the app and its signing certificates, hex SHA-256), `require_strongbox` and `verified_boot_keys` (hex). Wi-Fi certificates are unaffected. |
 | `openbao.*` | Address, CA file (required: the only CA trusted for OpenBao), optional TLS server name, AppRole role ID and secret ID files, and the mounts, roles and KV path (defaults as in the example). |
 
 [deploy/eap-enroll.service](deploy/eap-enroll.service) is an example

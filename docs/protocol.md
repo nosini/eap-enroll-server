@@ -109,7 +109,7 @@ without a usable attestation gets `400` with `bad_attestation`; the app
 should then generate its key with an attestation challenge and retry
 with the same code or credential. The service verifies the chain
 offline. This is not Play Integrity and needs no Google API (except the
-optional public revocation list); it works on stock Android and on
+public revocation list); it works on stock Android and on
 GrapheneOS, which reports `SelfSigned` verified boot with its own
 verified-boot key.
 

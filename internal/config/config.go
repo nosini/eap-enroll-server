@@ -219,11 +219,11 @@ func (c *Config) validate() error {
 	}
 	if a := c.KeyAttestation; a != nil {
 		file("key_attestation.roots_file", a.RootsFile, false)
-		if a.StatusURL != "" {
-			if u, err := url.Parse(a.StatusURL); err != nil || u.Scheme != "https" ||
-				u.Host == "" || u.User != nil || u.Fragment != "" {
-				errs = append(errs, errors.New("key_attestation.status_url must be an https URL"))
-			}
+		// Required: without the revocation list, chains from leaked
+		// attestation keys that Google has revoked still pass.
+		if u, err := url.Parse(a.StatusURL); err != nil || u.Scheme != "https" ||
+			u.Host == "" || u.User != nil || u.Fragment != "" {
+			errs = append(errs, errors.New("key_attestation.status_url is required and must be an https URL"))
 		}
 		for i, k := range a.VerifiedBootKeys {
 			if k == "" {
@@ -234,11 +234,14 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("key_attestation.verified_boot_keys[%d] is not hex: %w", i, err))
 			}
 		}
-		if a.AppPackage == "" && len(a.AppSigningCerts) != 0 {
-			errs = append(errs, errors.New("key_attestation.app_package is required with app_signing_certs"))
+		// Required: a renewal's challenge is the hash of the presented
+		// credential, which whoever holds a copy knows, so without the app
+		// check any Android device could attest a key for that copy.
+		if a.AppPackage == "" {
+			errs = append(errs, errors.New("key_attestation.app_package is required"))
 		}
-		if a.AppPackage != "" && len(a.AppSigningCerts) == 0 {
-			errs = append(errs, errors.New("key_attestation.app_signing_certs is required with app_package"))
+		if len(a.AppSigningCerts) == 0 {
+			errs = append(errs, errors.New("key_attestation.app_signing_certs is required"))
 		}
 		for i, s := range a.AppSigningCerts {
 			b, err := hex.DecodeString(s)

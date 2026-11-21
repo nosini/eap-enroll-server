@@ -13,6 +13,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"strings"
 	"testing"
@@ -100,9 +101,19 @@ func attAuthorizationList(fields ...attField) []byte {
 	return attSequence(parts...)
 }
 
+// The app the test attestations name, and its signing certificate digest.
+const testAppPackage = "org.example.eapenroll"
+
+var testAppDigest = bytes.Repeat([]byte{0xab}, 32)
+
 // attKeyDescription builds a valid TEE key description: generated, SIGN,
-// locked, SelfSigned verified boot.
+// locked, SelfSigned verified boot, for the test app.
 func attKeyDescription(challenge []byte) []byte {
+	return attKeyDescriptionFor(challenge, testAppPackage)
+}
+
+// attKeyDescriptionFor is attKeyDescription naming another app package.
+func attKeyDescriptionFor(challenge []byte, appPackage string) []byte {
 	bootKey := bytes.Repeat([]byte{0x5a}, 32)
 	rootOfTrust := attSequence(attOctets(bootKey), attBoolean(true), attEnumerated(1))
 	hardware := attAuthorizationList(
@@ -110,6 +121,11 @@ func attKeyDescription(challenge []byte) []byte {
 		attField{702, attInteger(0)},
 		attField{704, rootOfTrust},
 	)
+	appID := attSequence(
+		attSet(attSequence(attOctets([]byte(appPackage)), attInteger(1))),
+		attSet(attOctets(testAppDigest)),
+	)
+	software := attAuthorizationList(attField{709, attOctets(appID)})
 	return attSequence(
 		attInteger(200),
 		attEnumerated(1),
@@ -117,7 +133,7 @@ func attKeyDescription(challenge []byte) []byte {
 		attEnumerated(1),
 		attOctets(challenge),
 		attOctets(nil),
-		attAuthorizationList(),
+		software,
 		hardware,
 	)
 }
@@ -126,28 +142,40 @@ func attKeyDescription(challenge []byte) []byte {
 // first, then the intermediate and the pinned root.
 func attestationHeader(t testing.TB, root, inter *ca, key crypto.Signer, challenge []byte) string {
 	t.Helper()
+	return attestationHeaderFor(t, root, inter, key, attKeyDescription(challenge))
+}
+
+// attestationHeaderFor is attestationHeader with a given key description.
+func attestationHeaderFor(t testing.TB, root, inter *ca, key crypto.Signer, description []byte) string {
+	t.Helper()
 	leaf := issue(t, inter, &x509.Certificate{
 		Subject: pkix.Name{CommonName: "Android key attestation"},
 		ExtraExtensions: []pkix.Extension{{
-			Id: testAttestationOID, Value: attKeyDescription(challenge),
+			Id: testAttestationOID, Value: description,
 		}},
 	}, key.Public())
 	raw := append(append(append([]byte{}, leaf.Raw...), inter.cert.Raw...), root.cert.Raw...)
 	return base64.StdEncoding.EncodeToString(raw)
 }
 
-func newAttestationEnv(t *testing.T, change func(map[string]any, string)) (*env, *ca, *ca) {
+// newAttestationEnv runs the service with key attestation. The tests
+// can't fetch a revocation list, so the service runs without one unless
+// keepStatus is set; the attest package tests the list itself.
+func newAttestationEnv(t *testing.T, keepStatus bool) (*env, *ca, *ca) {
 	t.Helper()
 	root := newRoot(t, "Attestation Root")
 	inter := root.intermediate(t, "Attestation Intermediate")
 	e := newEnvWith(t, func(cfg map[string]any, dir string) {
 		cfg["key_attestation"] = map[string]any{
-			"roots_file": writeFile(t, dir, "att-roots.pem", pemCert(root.cert)),
-		}
-		if change != nil {
-			change(cfg, dir)
+			"roots_file":        writeFile(t, dir, "att-roots.pem", pemCert(root.cert)),
+			"status_url":        "https://status.example.org/attestation/status",
+			"app_package":       testAppPackage,
+			"app_signing_certs": []string{hex.EncodeToString(testAppDigest)},
 		}
 	})
+	if !keepStatus {
+		e.svc.attestStatus = nil
+	}
 	return e, root, inter
 }
 
@@ -168,7 +196,7 @@ func (e *env) postAttested(client *http.Client, path, bearer string, body []byte
 }
 
 func TestAttestationEnroll(t *testing.T) {
-	e, root, inter := newAttestationEnv(t, nil)
+	e, root, inter := newAttestationEnv(t, false)
 	code := e.code("alice", "Phone")
 	key := newKey(t, elliptic.P256())
 	challenge := sha256.Sum256([]byte(code))
@@ -191,7 +219,7 @@ func TestAttestationEnroll(t *testing.T) {
 }
 
 func TestAttestationDoesNotConsumeCode(t *testing.T) {
-	e, root, inter := newAttestationEnv(t, nil)
+	e, root, inter := newAttestationEnv(t, false)
 	c := e.client(nil)
 
 	// Missing header: 400, and the code is still usable.
@@ -230,7 +258,7 @@ func TestAttestationDoesNotConsumeCode(t *testing.T) {
 }
 
 func TestAttestationReenroll(t *testing.T) {
-	e, root, inter := newAttestationEnv(t, nil)
+	e, root, inter := newAttestationEnv(t, false)
 	code := e.code("alice", "Phone")
 	oldKey := newKey(t, elliptic.P256())
 	challenge := sha256.Sum256([]byte(code))
@@ -254,6 +282,16 @@ func TestAttestationReenroll(t *testing.T) {
 		t.Error("reenroll_device not logged")
 	}
 
+	// Whoever holds a copy of the credential knows the renewal challenge,
+	// but an attestation from another app (on any device) is refused.
+	otherAppKey := newKey(t, elliptic.P256())
+	if r := e.postAttested(oldDevice, "device/simplereenroll", "", csrBody(t, otherAppKey, "x"),
+		attestationHeaderFor(t, root, inter, otherAppKey,
+			attKeyDescriptionFor(newChallenge[:], "org.example.other"))); r.status != 403 ||
+		r.header.Get("Enroll-Error") != "attestation_refused" {
+		t.Errorf("attestation from another app: %d %q %s", r.status, r.header.Get("Enroll-Error"), r.body)
+	}
+
 	// The old enrollment challenge no longer works.
 	anotherKey := newKey(t, elliptic.P256())
 	challenge = sha256.Sum256([]byte(code))
@@ -274,10 +312,7 @@ func TestAttestationHeaderIgnoredWhenOff(t *testing.T) {
 }
 
 func TestAttestationStatusUnavailable(t *testing.T) {
-	e, root, inter := newAttestationEnv(t, func(cfg map[string]any, _ string) {
-		cfg["key_attestation"].(map[string]any)["status_url"] =
-			"https://status.example.org/attestation/status"
-	})
+	e, root, inter := newAttestationEnv(t, true)
 	code := e.code("alice", "Phone")
 	key := newKey(t, elliptic.P256())
 	challenge := sha256.Sum256([]byte(code))
