@@ -167,7 +167,8 @@ are required with it:
   a root key Google has since reissued (the RSA root), so only the
   pinned root's own validity counts. A chain without such a certificate
   must end in one signed by a pinned root. Each certificate is signed by
-  the next. Attestation chains often lack CA flags, so basic constraints
+  the next, with SHA-256 or stronger (RSA, RSA-PSS, ECDSA) or Ed25519;
+  SHA-1 and older are refused. Attestation chains often lack CA flags, so basic constraints
   are not required. The leaf's validity dates are ignored because
   Android's are unreliable; intermediates and the pinned root must be
   valid now.

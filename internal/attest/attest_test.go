@@ -10,6 +10,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -500,6 +501,42 @@ func TestVerifyChain(t *testing.T) {
 		if _, err := Verify(f.chain, f.key.Public(), challenge, f.policy, nil, time.Now().Add(72*time.Hour)); err == nil ||
 			!strings.Contains(err.Error(), "expired") {
 			t.Errorf("error %v", err)
+		}
+	})
+
+	t.Run("SHA-1 in the chain", func(t *testing.T) {
+		challenge := []byte("challenge")
+		rootKey, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rootTmpl := &x509.Certificate{
+			SerialNumber: testSerial(t), Subject: pkix.Name{CommonName: "RSA Root"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			IsCA: true, BasicConstraintsValid: true, SignatureAlgorithm: x509.SHA256WithRSA,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, rootTmpl, rootTmpl, rootKey.Public(), rootKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		root, _ := x509.ParseCertificate(der)
+		interKey := testKey(t)
+		interTmpl := &x509.Certificate{
+			SerialNumber: testSerial(t), Subject: pkix.Name{CommonName: "SHA-1 Intermediate"},
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+			IsCA: true, BasicConstraintsValid: true, SignatureAlgorithm: x509.SHA1WithRSA,
+		}
+		der, err = x509.CreateCertificate(rand.Reader, interTmpl, root, interKey.Public(), rootKey)
+		if err != nil {
+			t.Skipf("this Go can't create SHA-1 certificates: %v", err)
+		}
+		inter, _ := x509.ParseCertificate(der)
+		key := testKey(t)
+		leaf := newLeaf(t, &testCA{cert: inter, key: interKey}, key.Public(), goodDescription(challenge).encode())
+		_, err = Verify([]*x509.Certificate{leaf, inter, root}, key.Public(), challenge,
+			Policy{Roots: []*x509.Certificate{root}}, nil, time.Now())
+		if err == nil || !strings.Contains(err.Error(), "SHA1") {
+			t.Errorf("SHA-1 signed intermediate: %v", err)
 		}
 	})
 

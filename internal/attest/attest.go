@@ -139,7 +139,13 @@ func Verify(chain []*x509.Certificate, pub crypto.PublicKey, challenge []byte, p
 	}
 
 	// Attestation chains often lack CA flags, so only signatures are
-	// checked, not basic constraints.
+	// checked, not basic constraints. CheckSignature still accepts SHA-1,
+	// so weak algorithms are refused here.
+	for i, c := range chain {
+		if !strongSignature[c.SignatureAlgorithm] {
+			return res, fmt.Errorf("attestation certificate %d is signed with %v", i, c.SignatureAlgorithm)
+		}
+	}
 	for i := 0; i+1 < len(chain); i++ {
 		child, parent := chain[i], chain[i+1]
 		if err := parent.CheckSignature(child.SignatureAlgorithm, child.RawTBSCertificate, child.Signature); err != nil {
@@ -297,6 +303,21 @@ func Verify(chain []*x509.Certificate, pub crypto.PublicKey, challenge []byte, p
 		}
 	}
 	return res, nil
+}
+
+// strongSignature lists the signature algorithms accepted in attestation
+// chains (the leaf and the certificates up to the pinned root).
+var strongSignature = map[x509.SignatureAlgorithm]bool{
+	x509.SHA256WithRSA:    true,
+	x509.SHA384WithRSA:    true,
+	x509.SHA512WithRSA:    true,
+	x509.SHA256WithRSAPSS: true,
+	x509.SHA384WithRSAPSS: true,
+	x509.SHA512WithRSAPSS: true,
+	x509.ECDSAWithSHA256:  true,
+	x509.ECDSAWithSHA384:  true,
+	x509.ECDSAWithSHA512:  true,
+	x509.PureEd25519:      true,
 }
 
 // pinnedRoot returns the first pinned root that matches and is valid at
