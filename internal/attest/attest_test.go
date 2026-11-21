@@ -430,6 +430,79 @@ func TestVerifyChain(t *testing.T) {
 		}
 	})
 
+	// Devices keep the attestation chain from the factory, which can end
+	// in an older certificate for the same root key, as Google's RSA root
+	// was reissued with the same key.
+	reissue := func(t *testing.T, root *testCA, notBefore, notAfter time.Time) *x509.Certificate {
+		t.Helper()
+		tmpl := &x509.Certificate{
+			SerialNumber: testSerial(t), Subject: root.cert.Subject,
+			NotBefore: notBefore, NotAfter: notAfter,
+			IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, root.key.Public(), root.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	t.Run("chain ends in an expired copy of a pinned root", func(t *testing.T) {
+		f := newFixture(t, goodDescription(challenge))
+		old := reissue(t, f.root, time.Now().Add(-10*24*time.Hour), time.Now().Add(-24*time.Hour))
+		chain := []*x509.Certificate{f.chain[0], f.inter.cert, old}
+		if _, err := Verify(chain, f.key.Public(), challenge, f.policy, nil, time.Now()); err != nil {
+			t.Errorf("chain with an expired copy of the pinned root: %v", err)
+		}
+		// Anything after the root is ignored.
+		other := newTestCA(t, nil, "Other Root", nil)
+		chain = []*x509.Certificate{f.chain[0], f.inter.cert, f.root.cert, other.cert}
+		if _, err := Verify(chain, f.key.Public(), challenge, f.policy, nil, time.Now()); err != nil {
+			t.Errorf("certificates after the root: %v", err)
+		}
+		// Only the pinned root's own validity counts.
+		pinnedOld := Policy{Roots: []*x509.Certificate{old}}
+		if _, err := Verify(f.chain, f.key.Public(), challenge, pinnedOld, nil, time.Now()); err == nil ||
+			!strings.Contains(err.Error(), "expired") {
+			t.Errorf("expired pinned root: %v", err)
+		}
+		// A certificate with the root's subject but another key is no root.
+		impostor := newTestCA(t, nil, f.root.cert.Subject.CommonName, nil)
+		chain = []*x509.Certificate{f.chain[0], f.inter.cert, impostor.cert}
+		if _, err := Verify(chain, f.key.Public(), challenge, f.policy, nil, time.Now()); err == nil {
+			t.Error("chain ending in another key with the root's name accepted")
+		}
+	})
+
+	t.Run("leaf is a pinned root", func(t *testing.T) {
+		f := newFixture(t, goodDescription(challenge))
+		if _, err := Verify(f.chain[2:], f.key.Public(), challenge, f.policy, nil, time.Now()); err == nil {
+			t.Error("root as leaf accepted")
+		}
+	})
+
+	t.Run("broken link", func(t *testing.T) {
+		f := newFixture(t, goodDescription(challenge))
+		other := newTestCA(t, f.root, "Other Intermediate", nil)
+		chain := []*x509.Certificate{f.chain[0], other.cert, f.root.cert}
+		if _, err := Verify(chain, f.key.Public(), challenge, f.policy, nil, time.Now()); err == nil ||
+			!strings.Contains(err.Error(), "not signed by certificate") {
+			t.Errorf("error %v", err)
+		}
+	})
+
+	t.Run("expired intermediate or root", func(t *testing.T) {
+		f := newFixture(t, goodDescription(challenge))
+		if _, err := Verify(f.chain, f.key.Public(), challenge, f.policy, nil, time.Now().Add(72*time.Hour)); err == nil ||
+			!strings.Contains(err.Error(), "expired") {
+			t.Errorf("error %v", err)
+		}
+	})
+
 	t.Run("too many certificates", func(t *testing.T) {
 		f := newFixture(t, goodDescription(challenge))
 		for len(f.chain) <= maxChainLength {

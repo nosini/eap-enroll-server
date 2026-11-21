@@ -115,6 +115,29 @@ func Verify(chain []*x509.Certificate, pub crypto.PublicKey, challenge []byte, p
 		return res, errors.New("no attestation roots are configured")
 	}
 
+	// The chain ends at its first certificate that is a pinned root or
+	// has a pinned root's subject and key: devices may carry an older,
+	// even expired, certificate for the same root key. Certificates after
+	// it are ignored, and only the pinned root's validity counts.
+	// Otherwise the last certificate must be signed by a pinned root.
+	var anchor *x509.Certificate
+	for i, c := range chain {
+		root, err := pinnedRoot(p.Roots, now, func(root *x509.Certificate) bool {
+			return bytes.Equal(c.Raw, root.Raw) ||
+				(bytes.Equal(c.RawSubject, root.RawSubject) && publicKeyEqual(c.PublicKey, root.PublicKey))
+		})
+		if err != nil {
+			return res, err
+		}
+		if root != nil {
+			if i == 0 {
+				return res, errors.New("attestation leaf is a pinned root")
+			}
+			anchor, chain = root, chain[:i]
+			break
+		}
+	}
+
 	// Attestation chains often lack CA flags, so only signatures are
 	// checked, not basic constraints.
 	for i := 0; i+1 < len(chain); i++ {
@@ -123,33 +146,28 @@ func Verify(chain []*x509.Certificate, pub crypto.PublicKey, challenge []byte, p
 			return res, fmt.Errorf("attestation certificate %d is not signed by certificate %d: %w", i, i+1, err)
 		}
 	}
-	// The leaf's dates are unreliable; intermediates and roots must be
-	// valid now.
+	// The leaf's dates are unreliable; intermediates must be valid now.
 	for i := 1; i < len(chain); i++ {
 		if err := checkValidity(chain[i], now); err != nil {
 			return res, fmt.Errorf("attestation certificate %d: %w", i, err)
 		}
 	}
 	last := chain[len(chain)-1]
-	trusted := false
-	for _, root := range p.Roots {
-		if bytes.Equal(last.Raw, root.Raw) {
-			if err := checkValidity(root, now); err != nil {
-				return res, fmt.Errorf("attestation root %q: %w", root.Subject, err)
-			}
-			trusted = true
-			break
-		}
-		if err := root.CheckSignature(last.SignatureAlgorithm, last.RawTBSCertificate, last.Signature); err == nil {
-			if err := checkValidity(root, now); err != nil {
-				return res, fmt.Errorf("attestation root %q: %w", root.Subject, err)
-			}
-			trusted = true
-			break
-		}
+	signedBy := func(root *x509.Certificate) bool {
+		return root.CheckSignature(last.SignatureAlgorithm, last.RawTBSCertificate, last.Signature) == nil
 	}
-	if !trusted {
-		return res, errors.New("attestation chain is not signed by a pinned root")
+	if anchor != nil {
+		if !signedBy(anchor) {
+			return res, fmt.Errorf("attestation certificate %d is not signed by the pinned root %q", len(chain)-1, anchor.Subject)
+		}
+	} else {
+		root, err := pinnedRoot(p.Roots, now, signedBy)
+		if err != nil {
+			return res, err
+		}
+		if root == nil {
+			return res, errors.New("attestation chain is not signed by a pinned root")
+		}
 	}
 
 	if err := status.Check(chain, now); err != nil {
@@ -279,6 +297,26 @@ func Verify(chain []*x509.Certificate, pub crypto.PublicKey, challenge []byte, p
 		}
 	}
 	return res, nil
+}
+
+// pinnedRoot returns the first pinned root that matches and is valid at
+// now. If roots match but none is valid, it returns the error; if none
+// matches, nil and no error.
+func pinnedRoot(roots []*x509.Certificate, now time.Time, match func(*x509.Certificate) bool) (*x509.Certificate, error) {
+	var invalid error
+	for _, root := range roots {
+		if !match(root) {
+			continue
+		}
+		if err := checkValidity(root, now); err != nil {
+			if invalid == nil {
+				invalid = fmt.Errorf("attestation root %q: %w", root.Subject, err)
+			}
+			continue
+		}
+		return root, nil
+	}
+	return nil, invalid
 }
 
 func checkValidity(c *x509.Certificate, now time.Time) error {

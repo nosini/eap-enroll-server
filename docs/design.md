@@ -141,12 +141,17 @@ the CSR's key. Wi-Fi certificates are unaffected. The chain is verified
 offline (not Play Integrity, no Google API except the optional public
 status list):
 
-- The chain has 1 to 10 certificates, leaf first, and each certificate
-  is signed by the next. Attestation chains often lack CA flags, so
-  basic constraints are not required. The last certificate must be one
-  of the pinned roots or be signed by one. The leaf's validity dates are
-  ignored because Android's are unreliable; intermediates and roots
-  must be valid now.
+- The chain has 1 to 10 certificates, leaf first. It ends at its first
+  certificate that is a pinned root or has a pinned root's subject and
+  key; certificates after that are ignored. Devices keep the chain from
+  the factory, which may end in an older, even expired, certificate for
+  a root key Google has since reissued (the RSA root), so only the
+  pinned root's own validity counts. A chain without such a certificate
+  must end in one signed by a pinned root. Each certificate is signed by
+  the next. Attestation chains often lack CA flags, so basic constraints
+  are not required. The leaf's validity dates are ignored because
+  Android's are unreliable; intermediates and the pinned root must be
+  valid now.
 - If `status_url` is set, no certificate in the chain may have a serial
   listed as `REVOKED` or `SUSPENDED`. The list is fetched over HTTPS
   (30 s timeout, 10 MiB limit) at startup and every six hours, and
