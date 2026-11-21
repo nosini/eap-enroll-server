@@ -175,6 +175,9 @@ csr r2 prime256v1
 check "reuse: renew" 200 "$(est r2 device/simplereenroll --cert "$W/r1.pem" --key "$W/r1.key" --data-binary @"$W/r2.csr")"
 certs r2
 check "reuse: new credential" 200 "$(est r2p wifi/profile -X GET --cert "$W/r2.pem" --key "$W/r2.key")"
+# A connection accepted in the same second as the switch may be the
+# phone's old one and only gets 401 credential_superseded.
+sleep 1.1
 check "reuse: old credential" 403 "$(est r1old wifi/profile -X GET --cert "$W/r1.pem" --key "$W/r1.key")"
 check "reuse: new credential after reuse" 403 "$(est r2late wifi/profile -X GET --cert "$W/r2.pem" --key "$W/r2.key")"
 curl -s --cacert baotls/vault-ca.pem https://127.0.0.1:8200/v1/pki-enroll/crl/pem >"$W/enroll2.crl"

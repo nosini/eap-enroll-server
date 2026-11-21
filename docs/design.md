@@ -39,7 +39,8 @@ the phone's keystore and that only this service trusts.
   credential exists or the app kept using the old one against the
   protocol. Both can't be told apart, so the service assumes a copy.
   The owner needs a new code, and the copy stops working. The exception
-  is a connection accepted before the credential was superseded: the
+  is a connection accepted before the credential was superseded (or in
+  the same second, as times are stored in seconds): the
   phone may still have it open after switching, so a request on it gets
   401 `credential_superseded` instead. TLS session resumption is off,
   because a resumed session would present the credential of its first

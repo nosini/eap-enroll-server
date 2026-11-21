@@ -2,7 +2,7 @@
 
 What the service expects in OpenBao. Names are the configuration
 defaults. The roles and the policy below were tested against an OpenBao
-2.7.3 dev server with [test/openbao](../test/openbao) (2026-11-20).
+2.7.3 dev server with [test/openbao](../test/openbao) (2026-11-21).
 
 `allowed_parameters` compares values with their JSON type: the service
 sends `exclude_cn_from_sans` as the boolean `true`, which matches
