@@ -6,6 +6,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -234,5 +235,149 @@ func TestPruneDevices(t *testing.T) {
 	pruned, pending, err = s.PruneDevices(ctx, now)
 	if err != nil || len(pruned) != 1 || pruned[0].ID != unfinished.ID || len(pending) != 0 {
 		t.Errorf("second prune: %v %v %v", ids(pruned), ids(pending), err)
+	}
+}
+
+func TestCredentialUse(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	hash := []byte("code-hash")
+	if err := s.CreateCode(ctx, hash, "alice", "Phone", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := s.UseCode(ctx, hash, "00000000-0000-4000-8000-000000000005", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	add := func(serial string) {
+		t.Helper()
+		if err := s.AddCertificate(ctx, Certificate{
+			Serial: serial, Kind: KindDevice, DeviceID: dev.ID, Issued: now, NotAfter: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := func(serial string) Certificate {
+		t.Helper()
+		c, err := s.Certificate(ctx, KindDevice, serial)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	add("a")
+	if err := s.UseCredential(ctx, dev.ID, "a", now); err != nil {
+		t.Fatalf("use a: %v", err)
+	}
+	if c := state("a"); c.Used == nil || c.Superseded != nil {
+		t.Errorf("a after use: %+v", c)
+	}
+	if err := s.UseCredential(ctx, "00000000-0000-4000-8000-000000000006", "a", now); !errors.Is(err, ErrNotFound) {
+		t.Errorf("another device's credential: %v", err)
+	}
+
+	// Two renewals with a; b is replaced by c before it was used.
+	add("b")
+	add("c")
+	if got, err := s.SupersedeUnused(ctx, dev.ID, "a", "c", now); err != nil || len(got) != 1 || got[0] != "b" {
+		t.Fatalf("supersede unused: %v %v", got, err)
+	}
+	if c := state("b"); c.Superseded == nil {
+		t.Error("b not superseded")
+	}
+	if c := state("a"); c.Superseded != nil {
+		t.Error("the presented credential was superseded")
+	}
+	if err := s.UseCredential(ctx, dev.ID, "b", now); !errors.Is(err, ErrSuperseded) {
+		t.Errorf("use of a replaced renewal: %v", err)
+	}
+
+	// Using c supersedes a; a is then refused.
+	if err := s.UseCredential(ctx, dev.ID, "c", now); err != nil {
+		t.Fatalf("use c: %v", err)
+	}
+	if err := s.UseCredential(ctx, dev.ID, "a", now); !errors.Is(err, ErrSuperseded) {
+		t.Errorf("use of a superseded credential: %v", err)
+	}
+	// Used credentials are never replaced as unused.
+	add("d")
+	if got, err := s.SupersedeUnused(ctx, dev.ID, "a", "d", now); err != nil || len(got) != 0 {
+		t.Errorf("supersede after c was used: %v %v", got, err)
+	}
+
+	list, err := s.SupersededCertificates(ctx, dev.ID, now)
+	if err != nil || len(list) != 2 || list[0].Serial != "a" || list[1].Serial != "b" {
+		t.Fatalf("superseded: %+v %v", list, err)
+	}
+	if err := s.MarkRevoked(ctx, KindDevice, "a", now); err != nil {
+		t.Fatal(err)
+	}
+	if list, err := s.SupersededCertificates(ctx, dev.ID, now); err != nil || len(list) != 1 {
+		t.Errorf("superseded after revoking one: %+v %v", list, err)
+	}
+
+	// Superseded credentials don't count as valid: c and d.
+	var valid int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM certificates`).Scan(&valid); err != nil || valid != 4 {
+		t.Fatalf("certificates: %d %v", valid, err)
+	}
+	add("e") // the third valid one
+	if err := s.CheckCertificateLimit(ctx, dev.ID, KindDevice, now); !errors.Is(err, ErrTooManyCertificates) {
+		t.Errorf("check at the cap: %v", err)
+	}
+}
+
+func TestMigrateFromVersion1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enroll.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE codes (hash BLOB PRIMARY KEY, username TEXT NOT NULL, label TEXT NOT NULL,
+			created INTEGER NOT NULL, expires INTEGER NOT NULL, used INTEGER) STRICT`,
+		`CREATE TABLE devices (id TEXT PRIMARY KEY, username TEXT NOT NULL, label TEXT NOT NULL,
+			created INTEGER NOT NULL, disabled INTEGER) STRICT`,
+		`CREATE TABLE certificates (serial TEXT NOT NULL,
+			kind TEXT NOT NULL CHECK (kind IN ('device', 'wifi')),
+			device_id TEXT NOT NULL REFERENCES devices(id), issued INTEGER NOT NULL,
+			not_after INTEGER NOT NULL, revoked INTEGER, PRIMARY KEY (kind, serial)) STRICT`,
+		`CREATE INDEX certificates_device ON certificates(device_id)`,
+		`INSERT INTO devices VALUES ('d', 'alice', 'Phone', 1, NULL)`,
+		`INSERT INTO certificates VALUES ('old', 'device', 'd', 1, 9999999999, 5)`,
+		`INSERT INTO certificates VALUES ('new', 'device', 'd', 2, 9999999999, NULL)`,
+		`INSERT INTO certificates VALUES ('w', 'wifi', 'd', 2, 9999999999, 7)`,
+		`PRAGMA user_version = 1`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	old, err := s.Certificate(ctx, KindDevice, "old")
+	if err != nil || old.Superseded == nil || old.Superseded.Unix() != 5 {
+		t.Errorf("revoked device credential after migration: %+v %v", old, err)
+	}
+	if c, err := s.Certificate(ctx, KindDevice, "new"); err != nil || c.Superseded != nil || c.Used != nil {
+		t.Errorf("current device credential after migration: %+v %v", c, err)
+	}
+	if c, err := s.Certificate(ctx, KindWifi, "w"); err != nil || c.Superseded != nil {
+		t.Errorf("Wi-Fi certificate after migration: %+v %v", c, err)
+	}
+	if err := s.UseCredential(ctx, "d", "old", time.Now()); !errors.Is(err, ErrSuperseded) {
+		t.Errorf("revoked credential after migration: %v", err)
+	}
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != schemaVersion {
+		t.Errorf("version %d %v", version, err)
 	}
 }

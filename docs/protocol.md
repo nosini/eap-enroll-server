@@ -208,9 +208,15 @@ settings. `404` if the service has no profile configured.
 
 The old device credential keeps working after `device/simplereenroll`
 until the phone first authenticates with the new one; then the service
-revokes the older credentials of that device. So the phone must switch to
+retires the older credentials of that device. So the phone must switch to
 the new credential right after renewing and keep the old one until it
 has.
+
+If a renewal fails or its answer is lost, the phone keeps the old
+credential and simply renews again with it. Each renewal with the same
+credential retires the credential the previous one issued if that was
+never used, so the phone must only ever use the credential from the last
+renewal answer it got.
 
 Once the phone has stored the renewed credential it must never use the
 old one again, and it must not send requests with the old credential

@@ -75,7 +75,7 @@ func (s *Service) Handler() (http.Handler, error) {
 			return nil, err
 		}
 		mux.HandleFunc("GET "+estPrefix+"wifi/profile", s.authenticated("wifi_profile",
-			func(w http.ResponseWriter, r *http.Request, dev store.Device) {
+			func(w http.ResponseWriter, r *http.Request, dev store.Device, _ string) {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Cache-Control", "no-store")
 				w.Write(profile)
@@ -316,9 +316,10 @@ func (s *Service) handleDeviceEnroll(w http.ResponseWriter, r *http.Request) {
 }
 
 // authenticated wraps a handler that needs the device credential:
-// authentication, a per-device rate limit, the user check, and retiring
-// older device credentials once a newer one is in use.
-func (s *Service) authenticated(event string, next func(http.ResponseWriter, *http.Request, store.Device)) http.HandlerFunc {
+// authentication, a per-device rate limit, the user check, and revoking
+// superseded device credentials in OpenBao. next gets the device and the
+// serial of the presented credential.
+func (s *Service) authenticated(event string, next func(http.ResponseWriter, *http.Request, store.Device, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var chains [][]*x509.Certificate
 		if r.TLS != nil {
@@ -343,12 +344,13 @@ func (s *Service) authenticated(event string, next func(http.ResponseWriter, *ht
 		if !s.checkUser(w, r, event, dev) {
 			return
 		}
-		// The phone uses a renewed credential only once it has it, so
-		// the older ones can go. A failure is retried on the next request.
-		if err := s.revokeOlder(r.Context(), dev, store.KindDevice, serial); err != nil {
+		// Authenticate superseded the older credentials in the database;
+		// revoke them in OpenBao too. A failure is retried on the next
+		// request.
+		if err := s.retireSuperseded(r.Context(), dev); err != nil {
 			s.log.Error("revoke_failed", "device", dev.ID, "kind", store.KindDevice, "error", err.Error())
 		}
-		next(w, r, dev)
+		next(w, r, dev, serial)
 	}
 }
 
@@ -371,7 +373,7 @@ func (s *Service) checkUser(w http.ResponseWriter, r *http.Request, event string
 }
 
 func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
-	return s.authenticated(event, func(w http.ResponseWriter, r *http.Request, dev store.Device) {
+	return s.authenticated(event, func(w http.ResponseWriter, r *http.Request, dev store.Device, serial string) {
 		csr, err := readCSR(w, r, p)
 		if err != nil {
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
@@ -389,7 +391,12 @@ func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
 				return
 			}
 		}
-		certs, err := s.sign(r.Context(), p, dev, csr)
+		var certs []*x509.Certificate
+		if p.kind == store.KindDevice {
+			certs, err = s.ReenrollDevice(r.Context(), dev, serial, csr)
+		} else {
+			certs, err = s.EnrollWifi(r.Context(), dev, csr)
+		}
 		if err != nil {
 			s.refuse(w, r, event, err, "device", dev.ID, "username", dev.Username)
 			return
@@ -405,7 +412,7 @@ func (s *Service) handleEnroll(event string, p profile) http.HandlerFunc {
 
 // handleConfirm takes the serial (hex, colons allowed) of a Wi-Fi
 // certificate the phone has connected with and revokes the older ones.
-func (s *Service) handleConfirm(w http.ResponseWriter, r *http.Request, dev store.Device) {
+func (s *Service) handleConfirm(w http.ResponseWriter, r *http.Request, dev store.Device, _ string) {
 	const event = "confirm_wifi"
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256))
 	if err != nil {

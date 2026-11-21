@@ -9,6 +9,7 @@ import (
 	"crypto"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -155,18 +156,119 @@ func TestPerDeviceCertificateLimits(t *testing.T) {
 
 func TestPerDeviceCredentialLimits(t *testing.T) {
 	e := newEnv(t)
-	devTLS, _ := e.enrollDevice("alice")
+	devTLS, devCert := e.enrollDevice("alice")
 	device := e.client(devTLS)
-	// Two renewals leave three valid device credentials; using none of
-	// them retires the older ones.
-	for i := 0; i < 2; i++ {
-		if r := e.post(device, "device/simplereenroll", "", csrBody(t, newKey(t, elliptic.P256()), "x")); r.status != 200 {
+	// Each renewal replaces the unused one before it, so only the 24-hour
+	// cap applies: five device credentials, the first one included.
+	var renewed []*x509.Certificate
+	for i := 0; i < 4; i++ {
+		r := e.post(device, "device/simplereenroll", "", csrBody(t, newKey(t, elliptic.P256()), "x"))
+		if r.status != 200 {
 			t.Fatalf("renewal %d: %d %s", i, r.status, r.body)
 		}
+		renewed = append(renewed, r.certs[0])
 	}
 	r := e.post(device, "device/simplereenroll", "", csrBody(t, newKey(t, elliptic.P256()), "x"))
 	if r.status != 429 || r.header.Get("Retry-After") != "3600" {
-		t.Errorf("fourth valid device credential: %d %q", r.status, r.header.Get("Retry-After"))
+		t.Errorf("sixth device credential in 24 hours: %d %q", r.status, r.header.Get("Retry-After"))
+	}
+	for _, c := range renewed[:3] {
+		if !contains(e.bao.revoked["pki-enroll"], colonHex(c.SerialNumber)) {
+			t.Errorf("replaced unused credential %x not revoked", c.SerialNumber)
+		}
+	}
+	if contains(e.bao.revoked["pki-enroll"], colonHex(renewed[3].SerialNumber)) ||
+		contains(e.bao.revoked["pki-enroll"], colonHex(devCert.SerialNumber)) {
+		t.Error("current or newest credential revoked")
+	}
+}
+
+// Renewal answers that never reach the phone don't lock it out: each
+// renewal with the same credential replaces the unused one before it.
+func TestLostRenewalAnswers(t *testing.T) {
+	e := newEnv(t)
+	oldTLS, _ := e.enrollDevice("alice")
+	device := e.client(oldTLS)
+	for i := 0; i < 2; i++ {
+		if r := e.post(device, "device/simplereenroll", "", csrBody(t, newKey(t, elliptic.P256()), "x")); r.status != 200 {
+			t.Fatalf("lost renewal %d: %d %s", i, r.status, r.body)
+		}
+	}
+	e.now = e.now.Add(30 * 24 * time.Hour)
+	k := newKey(t, elliptic.P256())
+	r := e.post(device, "device/simplereenroll", "", csrBody(t, k, "x"))
+	if r.status != 200 {
+		t.Fatalf("renewal after lost answers: %d %q %s", r.status, r.header.Get("Enroll-Error"), r.body)
+	}
+	if r := e.post(e.client(tlsCert(r.certs, k)), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 200 {
+		t.Errorf("renewed credential: %d %s", r.status, r.body)
+	}
+	if n := e.events("credential_reuse"); n != 0 {
+		t.Errorf("credential_reuse logged %d times", n)
+	}
+}
+
+// A copy of the credential can't keep a renewal in reserve: the owner's
+// renewal replaces it, and using it then is reuse.
+func TestCopiedCredentialRenewalReplaced(t *testing.T) {
+	e := newEnv(t)
+	ownerTLS, _ := e.enrollDevice("alice")
+	attacker := e.client(ownerTLS)
+	var stolen []*tls.Certificate
+	for i := 0; i < 2; i++ {
+		k := newKey(t, elliptic.P256())
+		r := e.post(attacker, "device/simplereenroll", "", csrBody(t, k, "x"))
+		if r.status != 200 {
+			t.Fatalf("renewal by the copy %d: %d %s", i, r.status, r.body)
+		}
+		stolen = append(stolen, tlsCert(r.certs, k))
+	}
+	k := newKey(t, elliptic.P256())
+	r := e.post(e.client(ownerTLS), "device/simplereenroll", "", csrBody(t, k, "x"))
+	if r.status != 200 {
+		t.Fatalf("owner's renewal: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	owner := tlsCert(r.certs, k)
+	// Either replaced renewal is reuse; the first one disables the device.
+	if r := e.post(e.client(stolen[1]), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 ||
+		r.header.Get("Enroll-Error") != "credential_reuse" {
+		t.Errorf("renewal held by the copy: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	if r := e.post(e.client(stolen[0]), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 {
+		t.Errorf("older renewal held by the copy: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	if r := e.post(e.client(owner), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.status != 403 {
+		t.Errorf("owner's credential after the device was disabled: %d", r.status)
+	}
+}
+
+// The database refuses a superseded credential as soon as a newer one is
+// used, even while OpenBao can't revoke it.
+func TestReuseDetectedWhileOpenBaoFails(t *testing.T) {
+	e := newEnv(t)
+	oldTLS, oldCert := e.enrollDevice("alice")
+	k := newKey(t, elliptic.P256())
+	r := e.post(e.client(oldTLS), "device/simplereenroll", "", csrBody(t, k, "x"))
+	if r.status != 200 {
+		t.Fatalf("renew: %d %s", r.status, r.body)
+	}
+	newTLS := tlsCert(r.certs, k)
+	e.bao.failRot = true
+	if r := e.post(e.client(newTLS), "wifi/confirm", "", []byte("zz")); r.status != 400 {
+		t.Fatalf("renewed credential: %d %s", r.status, r.body)
+	}
+	if n := e.events("revoke_failed"); n == 0 {
+		t.Error("failed revocation not logged")
+	}
+	r = e.post(e.client(oldTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+	if r.status != 403 || r.header.Get("Enroll-Error") != "credential_reuse" {
+		t.Errorf("superseded credential while OpenBao fails: %d %q", r.status, r.header.Get("Enroll-Error"))
+	}
+	// Disabling records the revocation once OpenBao works again.
+	e.bao.failRot = false
+	id := strings.TrimPrefix(oldCert.URIs[0].String(), "urn:uuid:")
+	if remaining, err := e.svc.DisableDevice(context.Background(), id); err != nil || len(remaining) != 0 {
+		t.Errorf("disable retry: %v %v", remaining, err)
 	}
 }
 

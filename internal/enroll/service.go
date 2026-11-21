@@ -531,37 +531,52 @@ func (s *Service) Authenticate(ctx context.Context, verified [][]*x509.Certifica
 	if err != nil {
 		return dev, "", fail(500, "store_error", "internal error", err)
 	}
-	if cert.Revoked != nil {
-		// The device is enabled here, so the only way its credential was
-		// revoked is revokeOlder: a newer credential replaced it. Using a
-		// superseded credential means a copy exists (or the phone kept
-		// using the old one), so someone other than the owner may hold a
-		// valid credential. Disable the device; the owner gets a new code
-		// and the copy stops working. Expired credentials are handled
-		// below and stay a plain 401.
-		s.log.Error("credential_reuse", "device", dev.ID, "username", dev.Username,
-			"label", dev.Label, "serial", serial)
-		remaining, err := s.DisableDevice(context.WithoutCancel(ctx), dev.ID)
-		var revErr *RevocationError
-		switch {
-		case errors.As(err, &revErr):
-			// The device is disabled; an admin reruns `eap-enroll
-			// disable` to revoke the rest.
-			s.log.Error("revoke_failed", "device", dev.ID, "serials", remaining, "error", err.Error())
-		case err != nil:
-			// Not disabled: the next use of the credential tries again.
-			s.log.Error("disable_failed", "device", dev.ID, "error", err.Error())
-			return dev, "", fail(500, "store_error", "internal error", err)
-		}
-		return dev, "", fail(403, "credential_reuse", "device is disabled", nil)
+	if !strings.EqualFold(leaf.Subject.CommonName, dev.Username) {
+		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
+	}
+	if cert.Revoked != nil || cert.Superseded != nil {
+		return dev, "", s.credentialReuse(ctx, dev, serial)
 	}
 	if !s.now().Before(cert.NotAfter) {
 		return dev, "", fail(401, "expired_cert", "client certificate expired", nil)
 	}
-	if !strings.EqualFold(leaf.Subject.CommonName, dev.Username) {
+	// Marks the credential used and supersedes the older ones, checking
+	// again in the transaction that it isn't superseded itself.
+	err = s.store.UseCredential(ctx, dev.ID, serial, s.now())
+	switch {
+	case errors.Is(err, store.ErrSuperseded):
+		return dev, "", s.credentialReuse(ctx, dev, serial)
+	case errors.Is(err, store.ErrNotFound):
 		return dev, "", fail(401, "unknown_cert", "unknown client certificate", nil)
+	case err != nil:
+		return dev, "", fail(500, "store_error", "internal error", err)
 	}
 	return dev, serial, nil
+}
+
+// credentialReuse handles a superseded device credential presented while
+// its device is enabled. Only a newer credential's first use, or a
+// renewal that replaced it before it was used, supersedes a credential of
+// an enabled device. So someone other than the owner may hold a valid
+// credential (or the phone kept using the old one, which can't be told
+// apart): disable the device. The owner gets a new code and the copy stops
+// working.
+func (s *Service) credentialReuse(ctx context.Context, dev store.Device, serial string) error {
+	s.log.Error("credential_reuse", "device", dev.ID, "username", dev.Username,
+		"label", dev.Label, "serial", serial)
+	remaining, err := s.DisableDevice(context.WithoutCancel(ctx), dev.ID)
+	var revErr *RevocationError
+	switch {
+	case errors.As(err, &revErr):
+		// The device is disabled; an admin reruns `eap-enroll disable`
+		// to revoke the rest.
+		s.log.Error("revoke_failed", "device", dev.ID, "serials", remaining, "error", err.Error())
+	case err != nil:
+		// Not disabled: the next use of the credential tries again.
+		s.log.Error("disable_failed", "device", dev.ID, "error", err.Error())
+		return fail(500, "store_error", "internal error", err)
+	}
+	return fail(403, "credential_reuse", "device is disabled", nil)
 }
 
 // EnrollWifi issues a Wi-Fi certificate to an authenticated device.
@@ -569,11 +584,33 @@ func (s *Service) EnrollWifi(ctx context.Context, dev store.Device, csr *x509.Ce
 	return s.sign(ctx, s.wifiProfile(), dev, csr)
 }
 
-// ReenrollDevice issues a new device credential to an authenticated
-// device. The old one stays valid until it expires or the device is
-// disabled.
-func (s *Service) ReenrollDevice(ctx context.Context, dev store.Device, csr *x509.CertificateRequest) ([]*x509.Certificate, error) {
-	return s.sign(ctx, s.deviceProfile(), dev, csr)
+// ReenrollDevice issues a new device credential to a device that
+// authenticated with the credential presented. The presented one stays
+// valid until the new one is first used. Credentials that earlier
+// renewals with presented issued and that were never used are superseded:
+// the phone didn't get them, or someone else holds them. So a phone whose
+// renewal answers got lost can always renew again, and a copy of the
+// credential can't keep an unused renewal in reserve.
+func (s *Service) ReenrollDevice(ctx context.Context, dev store.Device, presented string, csr *x509.CertificateRequest) ([]*x509.Certificate, error) {
+	certs, err := s.sign(ctx, s.deviceProfile(), dev, csr)
+	if err != nil {
+		return nil, err
+	}
+	issued := openbao.SerialText(certs[0].SerialNumber)
+	unused, err := s.store.SupersedeUnused(ctx, dev.ID, presented, issued, s.now())
+	if err != nil {
+		// They stay valid until the next renewal or the new credential's
+		// first use; the new one is recorded, so answer with it.
+		s.log.Error("store_error", "device", dev.ID, "error", err.Error())
+		return certs, nil
+	}
+	if len(unused) > 0 {
+		s.log.Info("unused_credentials_superseded", "device", dev.ID, "username", dev.Username, "serials", unused)
+		if err := s.retireSuperseded(ctx, dev); err != nil {
+			s.log.Error("revoke_failed", "device", dev.ID, "kind", store.KindDevice, "error", err.Error())
+		}
+	}
+	return certs, nil
 }
 
 // RevocationError is DisableDevice's error once the device is disabled:
@@ -662,6 +699,18 @@ func (s *Service) revokeOlder(ctx context.Context, dev store.Device, kind, seria
 		return err
 	}
 	_, err = s.revoke(ctx, dev, older, "superseded")
+	return err
+}
+
+// retireSuperseded revokes the device's superseded device credentials in
+// OpenBao. The database already refuses them; this makes the CRL say so
+// too. A failure is retried on the next authenticated request.
+func (s *Service) retireSuperseded(ctx context.Context, dev store.Device) error {
+	certs, err := s.store.SupersededCertificates(ctx, dev.ID, s.now())
+	if err != nil || len(certs) == 0 {
+		return err
+	}
+	_, err = s.revoke(ctx, dev, certs, "superseded")
 	return err
 }
 

@@ -27,6 +27,7 @@ var (
 	ErrCodeExpired         = errors.New("code expired")
 	ErrDeviceDisabled      = errors.New("device is disabled")
 	ErrTooManyCertificates = errors.New("too many certificates for this device")
+	ErrSuperseded          = errors.New("device credential was superseded")
 )
 
 // Certificate kinds.
@@ -55,8 +56,9 @@ func limits(kind string) (valid, issued int) {
 }
 
 // schemaVersion is stored in PRAGMA user_version.
-const schemaVersion = 1
+const schemaVersion = 2
 
+// schema creates the current version in an empty database.
 var schema = []string{
 	`CREATE TABLE codes (
 		hash BLOB PRIMARY KEY,
@@ -80,9 +82,23 @@ var schema = []string{
 		issued INTEGER NOT NULL,
 		not_after INTEGER NOT NULL,
 		revoked INTEGER,
+		used INTEGER,
+		superseded INTEGER,
 		PRIMARY KEY (kind, serial)
 	) STRICT`,
 	`CREATE INDEX certificates_device ON certificates(device_id)`,
+}
+
+// migrations[v] brings a database from version v+1 to v+2.
+var migrations = [][]string{
+	// 1 -> 2: device credentials record their first use and when a newer
+	// one replaced them. Revoked ones were all replaced (or their device
+	// is disabled).
+	{
+		`ALTER TABLE certificates ADD COLUMN used INTEGER`,
+		`ALTER TABLE certificates ADD COLUMN superseded INTEGER`,
+		`UPDATE certificates SET superseded = revoked WHERE kind = 'device' AND revoked IS NOT NULL`,
+	},
 }
 
 // Device is a registered phone.
@@ -95,14 +111,18 @@ type Device struct {
 }
 
 // Certificate is an issued certificate. Serial is lowercase hex without
-// separators (openbao.SerialText).
+// separators (openbao.SerialText). Used and Superseded are only set for
+// device credentials: when the credential first authenticated, and when
+// a newer one took its place, after which presenting it is reuse.
 type Certificate struct {
-	Serial   string
-	Kind     string
-	DeviceID string
-	Issued   time.Time
-	NotAfter time.Time
-	Revoked  *time.Time
+	Serial     string
+	Kind       string
+	DeviceID   string
+	Issued     time.Time
+	NotAfter   time.Time
+	Revoked    *time.Time
+	Used       *time.Time
+	Superseded *time.Time
 }
 
 // Store is an open database.
@@ -147,15 +167,20 @@ func (s *Store) migrate() error {
 	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return err
 	}
+	var stmts []string
 	switch {
 	case version == schemaVersion:
 		return nil
 	case version > schemaVersion:
 		return fmt.Errorf("schema version %d is newer than this program (%d)", version, schemaVersion)
-	case version != 0:
-		return fmt.Errorf("no migration from schema version %d", version)
+	case version == 0:
+		stmts = schema
+	default:
+		for _, m := range migrations[version-1:] {
+			stmts = append(stmts, m...)
+		}
 	}
-	for _, stmt := range schema {
+	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
@@ -311,8 +336,8 @@ func (s *Store) AddCertificate(ctx context.Context, c Certificate) error {
 
 // CheckCertificateLimit reports whether the device may get another
 // certificate of kind at now: ErrTooManyCertificates if it already has
-// the maximum number of valid ones or was issued the maximum number
-// within issuanceWindow.
+// the maximum number of valid ones (unrevoked, unexpired and not
+// superseded) or was issued the maximum number within issuanceWindow.
 func (s *Store) CheckCertificateLimit(ctx context.Context, deviceID, kind string, now time.Time) error {
 	return checkLimits(ctx, s.db, deviceID, kind, now)
 }
@@ -322,7 +347,7 @@ func checkLimits(ctx context.Context, q queryer, deviceID, kind string, now time
 	var valid, issued int
 	err := q.QueryRowContext(ctx, `
 		SELECT
-		  coalesce(sum(CASE WHEN revoked IS NULL AND not_after > ? THEN 1 ELSE 0 END), 0),
+		  coalesce(sum(CASE WHEN revoked IS NULL AND superseded IS NULL AND not_after > ? THEN 1 ELSE 0 END), 0),
 		  coalesce(sum(CASE WHEN issued > ? THEN 1 ELSE 0 END), 0)
 		FROM certificates WHERE device_id = ? AND kind = ?`,
 		unix(now), unix(now.Add(-issuanceWindow)), deviceID, kind).Scan(&valid, &issued)
@@ -338,14 +363,19 @@ func checkLimits(ctx context.Context, q queryer, deviceID, kind string, now time
 
 // Certificate returns a certificate by kind and serial.
 func (s *Store) Certificate(ctx context.Context, kind, serial string) (Certificate, error) {
+	return readCertificate(ctx, s.db, kind, serial)
+}
+
+func readCertificate(ctx context.Context, q queryer, kind, serial string) (Certificate, error) {
 	var (
-		c                Certificate
-		issued, notAfter int64
-		revoked          sql.NullInt64
+		c                         Certificate
+		issued, notAfter          int64
+		revoked, used, superseded sql.NullInt64
 	)
-	err := s.db.QueryRowContext(ctx,
-		`SELECT serial, kind, device_id, issued, not_after, revoked FROM certificates WHERE kind = ? AND serial = ?`,
-		kind, serial).Scan(&c.Serial, &c.Kind, &c.DeviceID, &issued, &notAfter, &revoked)
+	err := q.QueryRowContext(ctx,
+		`SELECT serial, kind, device_id, issued, not_after, revoked, used, superseded
+		 FROM certificates WHERE kind = ? AND serial = ?`,
+		kind, serial).Scan(&c.Serial, &c.Kind, &c.DeviceID, &issued, &notAfter, &revoked, &used, &superseded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Certificate{}, ErrNotFound
 	}
@@ -353,7 +383,86 @@ func (s *Store) Certificate(ctx context.Context, kind, serial string) (Certifica
 		return Certificate{}, err
 	}
 	c.Issued, c.NotAfter, c.Revoked = fromUnix(issued), fromUnix(notAfter), fromNullUnix(revoked)
+	c.Used, c.Superseded = fromNullUnix(used), fromNullUnix(superseded)
 	return c, nil
+}
+
+// UseCredential records that a device credential authenticated at now:
+// it is marked used, and the device's older credentials are marked
+// superseded, so presenting one of them later is reuse. In the same
+// transaction it fails with ErrSuperseded if the credential itself was
+// superseded or revoked meanwhile, and with ErrNotFound if it isn't one
+// of the device's credentials.
+func (s *Store) UseCredential(ctx context.Context, deviceID, serial string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	c, err := readCertificate(ctx, tx, KindDevice, serial)
+	if err != nil {
+		return err
+	}
+	if c.DeviceID != deviceID {
+		return ErrNotFound
+	}
+	if c.Superseded != nil || c.Revoked != nil {
+		return ErrSuperseded
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE certificates SET used = coalesce(used, ?) WHERE kind = 'device' AND serial = ?`,
+		unix(now), serial); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE certificates SET superseded = ?
+		 WHERE device_id = ? AND kind = 'device' AND superseded IS NULL
+		   AND rowid < (SELECT rowid FROM certificates WHERE kind = 'device' AND serial = ?)`,
+		unix(now), deviceID, serial); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SupersedeUnused marks the device credentials that were issued after
+// presented and before issued and never used as superseded: renewals with
+// presented whose answers the phone didn't get, or that someone else
+// holds. It returns their serials.
+func (s *Store) SupersedeUnused(ctx context.Context, deviceID, presented, issued string, now time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`UPDATE certificates SET superseded = ?
+		 WHERE device_id = ? AND kind = 'device' AND used IS NULL AND superseded IS NULL AND revoked IS NULL
+		   AND rowid > (SELECT rowid FROM certificates WHERE kind = 'device' AND serial = ?)
+		   AND rowid < (SELECT rowid FROM certificates WHERE kind = 'device' AND serial = ?)
+		 RETURNING serial`,
+		unix(now), deviceID, presented, issued)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var serials []string
+	for rows.Next() {
+		var serial string
+		if err := rows.Scan(&serial); err != nil {
+			return nil, err
+		}
+		serials = append(serials, serial)
+	}
+	return serials, rows.Err()
+}
+
+// SupersededCertificates lists a device's superseded credentials that are
+// not yet revoked and not expired at now.
+func (s *Store) SupersededCertificates(ctx context.Context, deviceID string, now time.Time) ([]Certificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT serial, kind, device_id, issued, not_after FROM certificates
+		 WHERE device_id = ? AND kind = 'device' AND superseded IS NOT NULL
+		   AND revoked IS NULL AND not_after > ? ORDER BY rowid`,
+		deviceID, unix(now))
+	if err != nil {
+		return nil, err
+	}
+	return scanCertificates(rows)
 }
 
 // DisableDevice marks a device disabled (keeping an earlier time if it
@@ -435,12 +544,13 @@ type DeviceSummary struct {
 }
 
 // Devices lists all devices with the expiry of their newest unrevoked
-// certificate of each kind.
+// (and, for device credentials, not superseded) certificate of each kind.
 func (s *Store) Devices(ctx context.Context) ([]DeviceSummary, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT d.id, d.username, d.label, d.created, d.disabled,
 		  (SELECT max(not_after) FROM certificates WHERE device_id = d.id AND kind = 'wifi' AND revoked IS NULL),
-		  (SELECT max(not_after) FROM certificates WHERE device_id = d.id AND kind = 'device' AND revoked IS NULL)
+		  (SELECT max(not_after) FROM certificates
+		   WHERE device_id = d.id AND kind = 'device' AND revoked IS NULL AND superseded IS NULL)
 		FROM devices d ORDER BY d.username, d.created`)
 	if err != nil {
 		return nil, err
