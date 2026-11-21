@@ -233,9 +233,9 @@ also checks that the device's user is still enabled.
 Per device, the service issues at most 5 valid Wi-Fi certificates and 3
 valid device credentials, and at most 10 Wi-Fi certificates and 5 device
 credentials per 24 hours (revoked ones count). Over a limit the answer is
-429 with `Retry-After: 3600`. The valid-count cap is also enforced in the
-database transaction, so concurrent requests can't exceed it; a
-certificate issued in that race is revoked again.
+429 with `Retry-After: 3600`. Both caps are also enforced in the
+database transaction that records a certificate, so concurrent requests
+can't exceed them; a certificate issued in that race is revoked again.
 
 The limiter map holds at most 65536 client keys. Idle entries are swept
 once a minute; when the map is full, one entry is evicted for a new key,

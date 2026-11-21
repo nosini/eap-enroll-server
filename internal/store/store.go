@@ -275,12 +275,12 @@ func (s *Store) Device(ctx context.Context, id string) (Device, error) {
 
 // AddCertificate records an issued certificate. It fails with
 // ErrDeviceDisabled if the device was disabled meanwhile and with
-// ErrTooManyCertificates if the device already holds the maximum number
-// of valid certificates of that kind; the caller must then revoke the
+// ErrTooManyCertificates if the device is at one of the caps
+// CheckCertificateLimit checks; the caller must then revoke the
 // certificate. Because SQLite serialises writers, either this insert
 // happens before the device is disabled (and disabling sees and revokes
 // the certificate) or it fails, and concurrent requests can't exceed the
-// cap.
+// caps.
 func (s *Store) AddCertificate(ctx context.Context, c Certificate) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -298,15 +298,8 @@ func (s *Store) AddCertificate(ctx context.Context, c Certificate) error {
 	if disabled.Valid {
 		return ErrDeviceDisabled
 	}
-	var valid int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT count(*) FROM certificates
-		 WHERE device_id = ? AND kind = ? AND revoked IS NULL AND not_after > ?`,
-		c.DeviceID, c.Kind, unix(c.Issued)).Scan(&valid); err != nil {
+	if err := checkLimits(ctx, tx, c.DeviceID, c.Kind, c.Issued); err != nil {
 		return err
-	}
-	if maxValid, _ := limits(c.Kind); valid >= maxValid {
-		return ErrTooManyCertificates
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO certificates (serial, kind, device_id, issued, not_after) VALUES (?, ?, ?, ?, ?)`,
@@ -321,8 +314,13 @@ func (s *Store) AddCertificate(ctx context.Context, c Certificate) error {
 // the maximum number of valid ones or was issued the maximum number
 // within issuanceWindow.
 func (s *Store) CheckCertificateLimit(ctx context.Context, deviceID, kind string, now time.Time) error {
+	return checkLimits(ctx, s.db, deviceID, kind, now)
+}
+
+// checkLimits is CheckCertificateLimit on a database or transaction.
+func checkLimits(ctx context.Context, q queryer, deviceID, kind string, now time.Time) error {
 	var valid, issued int
-	err := s.db.QueryRowContext(ctx, `
+	err := q.QueryRowContext(ctx, `
 		SELECT
 		  coalesce(sum(CASE WHEN revoked IS NULL AND not_after > ? THEN 1 ELSE 0 END), 0),
 		  coalesce(sum(CASE WHEN issued > ? THEN 1 ELSE 0 END), 0)

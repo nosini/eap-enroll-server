@@ -121,6 +121,14 @@ func TestCertificateLimits(t *testing.T) {
 	if err := s.CheckCertificateLimit(ctx, dev.ID, KindDevice, now); !errors.Is(err, ErrTooManyCertificates) {
 		t.Errorf("check at the 24 hour cap: %v", err)
 	}
+	// The transaction enforces it too, so concurrent requests that all
+	// passed the check can't exceed it.
+	if err := add(KindDevice, "device5", now); !errors.Is(err, ErrTooManyCertificates) {
+		t.Errorf("add at the 24 hour cap: %v", err)
+	}
+	if err := add(KindDevice, "device5", now.Add(issuanceWindow+time.Minute)); err != nil {
+		t.Errorf("add after the window: %v", err)
+	}
 	if err := s.CheckCertificateLimit(ctx, dev.ID, KindDevice, now.Add(issuanceWindow+time.Minute)); err != nil {
 		t.Errorf("check after the window: %v", err)
 	}
