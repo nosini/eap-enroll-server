@@ -394,3 +394,46 @@ func TestWrongIssuerFromOpenBao(t *testing.T) {
 		t.Errorf("wrong certificate not revoked: %v %v", e.bao.revoked, e.bao.rotates)
 	}
 }
+
+// An answer that can't be used may still have issued a certificate; it
+// is revoked, not left valid and unrecorded.
+func TestUnusableSignAnswerRevoked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*fakeBao)
+	}{
+		{"bad chain", func(f *fakeBao) { f.badChain = true }},
+		{"two certificates", func(f *fakeBao) { f.twoCerts = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			devTLS, _ := e.enrollDevice("alice")
+			tc.set(e.bao)
+			r := e.post(e.client(devTLS), "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x"))
+			if r.status != 502 || r.header.Get("Enroll-Error") != "openbao_wrong_certificate" {
+				t.Fatalf("unusable answer: %d %q %s", r.status, r.header.Get("Enroll-Error"), r.body)
+			}
+			issued := e.bao.issued[len(e.bao.issued)-1]
+			if got := e.bao.revoked["pki-radius"]; len(got) != 1 || got[0] != colonHex(issued.SerialNumber) ||
+				e.bao.rotates["pki-radius"] != 1 {
+				t.Errorf("issued certificate not revoked: %v %v", got, e.bao.rotates)
+			}
+			if _, err := e.store.Certificate(context.Background(), store.KindWifi,
+				openbao.SerialText(issued.SerialNumber)); err == nil {
+				t.Error("certificate from an unusable answer recorded")
+			}
+		})
+	}
+
+	// At device enrollment the code is used, the device removed again and
+	// its credential revoked.
+	e := newEnv(t)
+	e.bao.badChain = true
+	r := e.post(e.client(nil), "device/simpleenroll", e.code("alice", "Phone"), csrBody(t, newKey(t, elliptic.P256()), "x"))
+	if r.status != 502 {
+		t.Fatalf("device enrollment with an unusable answer: %d %s", r.status, r.body)
+	}
+	if got := e.bao.revoked["pki-enroll"]; len(got) != 1 || got[0] != colonHex(e.bao.issued[0].SerialNumber) {
+		t.Errorf("device credential not revoked: %v", got)
+	}
+}

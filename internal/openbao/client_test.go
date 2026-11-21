@@ -5,6 +5,7 @@
 package openbao
 
 import (
+	"crypto/x509"
 	"errors"
 	"math/big"
 	"testing"
@@ -42,6 +43,27 @@ func TestSerials(t *testing.T) {
 	for _, bad := range []string{"", "abc", "zz"} {
 		if _, err := colonSerial(bad); err == nil {
 			t.Errorf("colonSerial(%q) accepted", bad)
+		}
+	}
+}
+
+func TestSerialFromAnswer(t *testing.T) {
+	parsed := []*x509.Certificate{{SerialNumber: big.NewInt(0x1234)}}
+	for _, tc := range []struct {
+		serial string
+		parsed []*x509.Certificate
+		want   string
+	}{
+		{"00:ab:0c", nil, "ab0c"},
+		{"ab:0c", parsed, "ab0c"},
+		{"", parsed, "1234"},
+		{"zz", parsed, "1234"},
+		{"00:00", parsed, "1234"},
+		{"", append(parsed, parsed[0]), ""},
+		{"", nil, ""},
+	} {
+		if got := serialFromAnswer(tc.serial, tc.parsed); got != tc.want {
+			t.Errorf("serialFromAnswer(%q, %d certificates) = %q, want %q", tc.serial, len(tc.parsed), got, tc.want)
 		}
 	}
 }

@@ -296,13 +296,28 @@ type Signed struct {
 	Chain       []*x509.Certificate
 }
 
-// Sign signs a PEM CSR with mount/role.
+// IssuedError means OpenBao answered a sign request, so it may have
+// issued a certificate, but the answer can't be used. Serial (SerialText
+// form) is the issued certificate's serial if the answer names one; the
+// caller must revoke it.
+type IssuedError struct {
+	Serial string
+	Err    error
+}
+
+func (e *IssuedError) Error() string { return "openbao sign: " + e.Err.Error() }
+
+func (e *IssuedError) Unwrap() error { return e.Err }
+
+// Sign signs a PEM CSR with mount/role. If OpenBao answers but the answer
+// is unusable, the error is an *IssuedError.
 func (c *Client) Sign(ctx context.Context, mount, role string, req SignRequest) (*Signed, error) {
 	var resp struct {
 		Data struct {
-			Certificate string   `json:"certificate"`
-			CAChain     []string `json:"ca_chain"`
-			IssuingCA   string   `json:"issuing_ca"`
+			Certificate  string   `json:"certificate"`
+			CAChain      []string `json:"ca_chain"`
+			IssuingCA    string   `json:"issuing_ca"`
+			SerialNumber string   `json:"serial_number"`
 		} `json:"data"`
 	}
 	if err := c.call(ctx, http.MethodPost, mount+"/sign/"+role, req, &resp); err != nil {
@@ -310,7 +325,8 @@ func (c *Client) Sign(ctx context.Context, mount, role string, req SignRequest) 
 	}
 	leaf, err := parsePEMCertificates(resp.Data.Certificate)
 	if err != nil || len(leaf) != 1 {
-		return nil, fmt.Errorf("openbao sign: answer has no single certificate")
+		return nil, &IssuedError{Serial: serialFromAnswer(resp.Data.SerialNumber, leaf),
+			Err: errors.New("answer has no single certificate")}
 	}
 	chainPEM := resp.Data.CAChain
 	if len(chainPEM) == 0 && resp.Data.IssuingCA != "" {
@@ -320,11 +336,27 @@ func (c *Client) Sign(ctx context.Context, mount, role string, req SignRequest) 
 	for _, p := range chainPEM {
 		certs, err := parsePEMCertificates(p)
 		if err != nil {
-			return nil, fmt.Errorf("openbao sign: bad CA chain: %w", err)
+			return nil, &IssuedError{Serial: SerialText(leaf[0].SerialNumber),
+				Err: fmt.Errorf("bad CA chain: %w", err)}
 		}
 		chain = append(chain, certs...)
 	}
 	return &Signed{Certificate: leaf[0], Chain: chain}, nil
+}
+
+// serialFromAnswer finds the serial of the certificate a sign answer
+// issued when its certificate field is unusable: OpenBao's serial_number
+// (aa:bb:cc) if it is valid, otherwise the only parsed certificate's.
+func serialFromAnswer(serialNumber string, parsed []*x509.Certificate) string {
+	if b, err := hex.DecodeString(strings.ReplaceAll(serialNumber, ":", "")); err == nil && len(b) > 0 {
+		if n := new(big.Int).SetBytes(b); n.Sign() > 0 {
+			return SerialText(n)
+		}
+	}
+	if len(parsed) == 1 {
+		return SerialText(parsed[0].SerialNumber)
+	}
+	return ""
 }
 
 // Revoke revokes a certificate by serial (as returned by SerialText).

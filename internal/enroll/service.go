@@ -420,6 +420,17 @@ func (s *Service) sign(ctx context.Context, p profile, dev store.Device, csr *x5
 	}
 	signed, err := s.bao.Sign(ctx, p.mount, p.role, req)
 	if err != nil {
+		// OpenBao may have issued a certificate that can't be used; it
+		// mustn't stay valid unrecorded.
+		var issued *openbao.IssuedError
+		if errors.As(err, &issued) {
+			if issued.Serial != "" {
+				s.revokeUnrecorded(ctx, p.mount, issued.Serial)
+			} else {
+				s.log.Error("revoke_failed", "mount", p.mount, "error", "unusable sign answer names no serial")
+			}
+			return nil, fail(502, "openbao_wrong_certificate", "certificate authority error", err)
+		}
 		return nil, fail(502, "openbao_error", "certificate authority unavailable", err)
 	}
 	serial := openbao.SerialText(signed.Certificate.SerialNumber)

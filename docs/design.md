@@ -119,7 +119,10 @@ After OpenBao signs, the result is checked before it is recorded or sent:
   the chain OpenBao returned. For a chain that isn't empty, the check
   against its first CA stays too.
 
-A certificate that fails these checks is revoked at once.
+A certificate that fails these checks is revoked at once, and so is one
+from an answer the service can't use (a CA chain that doesn't parse,
+more than one certificate); then the serial comes from the answer's
+`serial_number`.
 
 Races with disabling: a certificate is recorded in a transaction that
 fails if the device is disabled. SQLite serialises writers, so either the

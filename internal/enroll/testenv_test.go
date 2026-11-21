@@ -141,6 +141,12 @@ type fakeBao struct {
 	// issuing_ca or ca_chain.
 	signCA     *ca
 	emptyChain bool
+	// badChain answers with a ca_chain entry that doesn't parse, and
+	// twoCerts with two certificates in the certificate field.
+	badChain bool
+	twoCerts bool
+	// issued are the certificates the fake signed, in order.
+	issued []*x509.Certificate
 }
 
 const (
@@ -250,13 +256,20 @@ func (f *fakeBao) sign(w http.ResponseWriter, mount string, body map[string]any)
 		f.mutate(tmpl)
 	}
 	cert := issue(f.t, issuer, tmpl, csr.PublicKey)
+	f.issued = append(f.issued, cert)
 	data := map[string]any{
 		"certificate":   pemCert(cert),
 		"serial_number": colonHex(cert.SerialNumber),
 	}
+	if f.twoCerts {
+		data["certificate"] = pemCert(cert) + pemCert(issuer.cert)
+	}
 	if !f.emptyChain {
 		data["issuing_ca"] = pemCert(issuer.cert)
 		data["ca_chain"] = []string{pemCert(issuer.cert), pemCert(f.root.cert)}
+	}
+	if f.badChain {
+		data["ca_chain"] = []string{"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"}
 	}
 	f.reply(w, 200, map[string]any{"data": data})
 }
