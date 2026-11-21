@@ -30,8 +30,19 @@ Parameters may come in any order and are URL-encoded.
 ## TLS
 
 TLS 1.3 only. The server asks for a client certificate but doesn't
-require one; requests without a valid one fail on the endpoints that
-need it (401).
+require one; requests without one fail on the endpoints that need it
+(401).
+
+A client certificate that is sent is verified in the TLS handshake:
+one that has expired, or that isn't from the device CA, makes the
+handshake fail with a TLS alert (`certificate_expired`, `unknown_ca` or
+`bad_certificate`) before any HTTP answer. So:
+
+- Offer the device credential only on the endpoints that need it, never
+  on `cacerts` or `device/simpleenroll`. Otherwise a phone whose
+  credential has expired can't even set itself up again with a new code.
+- Check the credential's expiry before using it. An expired credential
+  needs a new code, just like a 401; don't retry the handshake.
 
 The server doesn't resume TLS sessions, so every new connection
 presents the credential the phone holds now. A connection keeps the
@@ -93,7 +104,7 @@ credential instead.
 | Status | Meaning | Client action |
 | --- | --- | --- |
 | 400 | Malformed body, bad CSR, wrong key type, or missing/malformed key attestation when required (`bad_attestation`) | Fix the request; don't retry as is |
-| 401 | Missing, wrong, used or expired code; missing, unknown or expired device credential | Setup needs a new code |
+| 401 | Missing, wrong, used or expired code; missing or unknown device credential (an expired one fails the TLS handshake, see [TLS](#tls)) | Setup needs a new code |
 | 401 (`credential_superseded`) | The request came over a connection opened with a device credential that has since been replaced | Close the connection and retry with the current credential |
 | 403 | Device or user disabled, a superseded device credential was reused, or key attestation was refused (`attestation_refused`) | Stop; tell the user |
 | 413 | Body too large | Don't retry |
@@ -101,9 +112,14 @@ credential instead.
 | 502 | The certificate authority failed, or the key attestation status list is unavailable (`attestation_status_unavailable`) | Retry later |
 | 500 | Other server error | Retry later |
 
-A missing, wrong, used or expired code is answered with 401 before the
-CSR is read; a bad CSR (400) doesn't use up a one-time code, any other
-answer to `device/simpleenroll` does.
+`device/simpleenroll` checks, in this order, that the code is usable
+(401 if it is missing, wrong, used or expired), the request body (400,
+413) and, if required, the key attestation (400, 403, 502). None of
+these use up the code, so the phone can fix the request and send it
+again with the same code. Only then is the code used up: any answer
+after that, success or not (403 `user_disabled`, 429, 502, 500), means
+setup needs a new code. A 500 or 502 doesn't say whether the code got
+that far; if retrying with it gets 401 `code_used`, it did.
 
 Every endpoint that needs the device credential also checks that the
 device's user is still enabled; a disabled user gets 403 on all of them.

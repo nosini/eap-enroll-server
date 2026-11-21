@@ -609,3 +609,29 @@ func TestSupersededOnOldConnection(t *testing.T) {
 		t.Errorf("new connection: %d %q", r.status, r.header.Get("Enroll-Error"))
 	}
 }
+
+// An expired device credential fails the TLS handshake, as
+// docs/protocol.md says, on every endpoint it is offered to; without it,
+// setup with a new code works.
+func TestExpiredCredentialFailsHandshake(t *testing.T) {
+	e := newEnv(t)
+	_, devCert := e.enrollDevice("alice")
+	key := newKey(t, elliptic.P256())
+	expired := issue(t, e.deviceCA, &x509.Certificate{
+		Subject: pkix.Name{CommonName: "alice"}, URIs: devCert.URIs,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		NotBefore:   time.Now().Add(-48 * time.Hour), NotAfter: time.Now().Add(-time.Hour),
+	}, key.Public())
+	stale := e.client(tlsCert([]*x509.Certificate{expired}, key))
+	if r := e.post(stale, "wifi/simpleenroll", "", csrBody(t, newKey(t, elliptic.P384()), "x")); r.err == nil ||
+		!strings.Contains(r.err.Error(), "expired certificate") {
+		t.Errorf("expired credential: %d %v", r.status, r.err)
+	}
+	code := e.code("alice", "Phone")
+	if r := e.post(stale, "device/simpleenroll", code, csrBody(t, newKey(t, elliptic.P256()), "x")); r.err == nil {
+		t.Errorf("setup offering the expired credential: %d", r.status)
+	}
+	if r := e.post(e.client(nil), "device/simpleenroll", code, csrBody(t, newKey(t, elliptic.P256()), "x")); r.status != 200 {
+		t.Errorf("setup without a client certificate: %d %s", r.status, r.body)
+	}
+}
