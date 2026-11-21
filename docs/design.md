@@ -101,9 +101,12 @@ After OpenBao signs, the result is checked before it is recorded or sent:
 
 - CN is the username and exactly one CN attribute, and the only subject
   attributes are CN, C, L, ST, O and OU.
-- The public key is the CSR's and it is not a CA.
-- Its extended key usage is client authentication without server
-  authentication.
+- The public key is the CSR's and it is not a CA: no CA flag, and its
+  key usage doesn't allow signing certificates or CRLs (some verifiers
+  treat a certificate with `keyCertSign` and no basic constraints as a
+  CA).
+- Its extended key usage is exactly client authentication: nothing else,
+  not even unknown purposes.
 - Its subjectAltName extension is parsed as ASN.1: Wi-Fi certificates have
   no SAN or no names; device credentials have exactly one URI name, the
   device URI. Other name types (otherName/UPN, directory names, registered

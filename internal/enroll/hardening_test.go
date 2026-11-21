@@ -287,6 +287,54 @@ func TestCheckIssued(t *testing.T) {
 	if err := checkIssued(issued(wifiCA, long, true), csr, "alice", "", wifi, now); err == nil {
 		t.Error("certificate that outlives the TTL accepted")
 	}
+	certSign := base()
+	certSign.KeyUsage |= x509.KeyUsageCertSign
+	if err := checkIssued(issued(wifiCA, certSign, true), csr, "alice", "", wifi, now); err == nil {
+		t.Error("keyCertSign without basicConstraints accepted")
+	}
+	crlSign := base()
+	crlSign.KeyUsage |= x509.KeyUsageCRLSign
+	if err := checkIssued(issued(wifiCA, crlSign, true), csr, "alice", "", wifi, now); err == nil {
+		t.Error("cRLSign accepted")
+	}
+	isCA := base()
+	isCA.BasicConstraintsValid, isCA.IsCA = true, true
+	if err := checkIssued(issued(wifiCA, isCA, true), csr, "alice", "", wifi, now); err == nil {
+		t.Error("CA certificate accepted")
+	}
+	for name, ekus := range map[string][]x509.ExtKeyUsage{
+		"no EKU":       nil,
+		"serverAuth":   {x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		"anyEKU":       {x509.ExtKeyUsageAny},
+		"OCSP signing": {x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageOCSPSigning},
+		"code signing": {x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageCodeSigning},
+	} {
+		tmpl := base()
+		tmpl.ExtKeyUsage = ekus
+		if err := checkIssued(issued(wifiCA, tmpl, true), csr, "alice", "", wifi, now); err == nil {
+			t.Errorf("EKU %s accepted", name)
+		}
+	}
+	unknownEKU := base()
+	unknownEKU.UnknownExtKeyUsage = []asn1.ObjectIdentifier{{1, 3, 6, 1, 4, 1, 311, 20, 2, 2}} // smartcard logon
+	if err := checkIssued(issued(wifiCA, unknownEKU, true), csr, "alice", "", wifi, now); err == nil {
+		t.Error("unknown extra EKU accepted")
+	}
+	otherKey := newKey(t, elliptic.P384())
+	if err := checkIssued(&openbao.Signed{Certificate: issue(t, wifiCA, base(), otherKey.Public())},
+		csr, "alice", "", wifi, now); err == nil {
+		t.Error("certificate for another key accepted")
+	}
+	expired := base()
+	expired.NotBefore, expired.NotAfter = now.Add(-2*time.Hour), now.Add(-time.Minute)
+	if err := checkIssued(issued(wifiCA, expired, true), csr, "alice", "", wifi, now); err == nil {
+		t.Error("expired certificate accepted")
+	}
+	wrongChain := issued(wifiCA, base(), false)
+	wrongChain.Chain = []*x509.Certificate{otherCA.cert}
+	if err := checkIssued(wrongChain, csr, "alice", "", wifi, now); err == nil {
+		t.Error("certificate not signed by the first CA of the returned chain accepted")
+	}
 	critical := base()
 	critical.ExtraExtensions = []pkix.Extension{
 		{Id: asn1.ObjectIdentifier{1, 2, 3, 4}, Critical: true, Value: []byte{0x05, 0x00}},

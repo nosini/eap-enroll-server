@@ -22,7 +22,11 @@ issues from. The role must:
   `allow_bare_domains=true`, `allow_subdomains=false`,
   `allow_glob_domains=false`, `allow_any_name=false`,
   `enforce_hostnames=false`);
-- be client-only (`client_flag=true`, `server_flag=false`);
+- be client-only (`client_flag=true`, `server_flag=false`,
+  `code_signing_flag=false`, `email_protection_flag=false`, empty
+  `ext_key_usage` and `ext_key_usage_oids`, and no `CertSign` or
+  `CRLSign` in `key_usage`): the service refuses certificates with any
+  other purpose;
 - use `key_type=ec`, `key_bits=384`;
 - store certificates (`no_store=false`), otherwise revoking by serial
   fails;

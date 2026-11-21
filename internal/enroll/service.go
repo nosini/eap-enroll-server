@@ -272,9 +272,14 @@ func checkIssued(signed *openbao.Signed, csr *x509.CertificateRequest, username,
 	if c.IsCA {
 		return errors.New("issued certificate is a CA")
 	}
-	if !slices.Contains(c.ExtKeyUsage, x509.ExtKeyUsageClientAuth) ||
-		slices.Contains(c.ExtKeyUsage, x509.ExtKeyUsageServerAuth) ||
-		slices.Contains(c.ExtKeyUsage, x509.ExtKeyUsageAny) {
+	// Without basicConstraints, some verifiers (OpenSSL outside strict
+	// mode) take keyCertSign to mean a CA, so the phone could issue
+	// certificates of its own under the Wi-Fi CA.
+	if c.KeyUsage&(x509.KeyUsageCertSign|x509.KeyUsageCRLSign) != 0 {
+		return errors.New("issued certificate may sign certificates or CRLs")
+	}
+	if !slices.Equal(c.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}) ||
+		len(c.UnknownExtKeyUsage) != 0 {
 		return errors.New("issued certificate is not for client authentication only")
 	}
 	if len(c.DNSNames)+len(c.EmailAddresses)+len(c.IPAddresses) != 0 {
